@@ -1,4 +1,4 @@
-"""Deterministic FCFS control tests for scheduler policy abstraction (no GPU)."""
+"""Deterministic FCFS control + SJF waiting-admission tests (no GPU)."""
 
 from collections import deque
 
@@ -8,6 +8,8 @@ from nanovllm.engine.scheduler_metrics import SchedulerMetrics
 from nanovllm.engine.scheduler_policy import (
     remaining_prefill_score,
     select_waiting_index,
+    sjf_total_bound_score,
+    waiting_selection_key,
 )
 from nanovllm.engine.sequence import Sequence, SequenceStatus
 from nanovllm.sampling_params import SamplingParams
@@ -42,6 +44,7 @@ def _seq(n_prompt: int, max_tokens: int = 4) -> Sequence:
 
 
 def _admission_order(policy: str) -> list[int]:
+    """Return prompt lengths in the order requests are first admitted."""
     sched = _make_scheduler(policy=policy, max_batched_tokens=32, max_seqs=1)
     a = _seq(4000)
     b = _seq(100)
@@ -78,13 +81,39 @@ def test_fcfs_admits_in_arrival_order():
     assert _admission_order("fcfs") == [4000, 100, 500]
 
 
-def test_fcfs_selection_index_is_always_head():
+def test_sjf_admits_shortest_remaining_prefill_first():
+    """SJF over remaining_prefill_tokens: B(100) -> C(500) -> A(4000)."""
+    assert _admission_order("sjf") == [100, 500, 4000]
+
+
+def test_sjf_deterministic_tie_break_by_seq_id():
+    sched = _make_scheduler(policy="sjf", max_batched_tokens=16, max_seqs=1)
+    a = _seq(200)
+    b = _seq(200)
+    assert remaining_prefill_score(a) == remaining_prefill_score(b) == 200
+    assert a.seq_id < b.seq_id
+    sched.add(a)
+    sched.add(b)
+    out = sched.schedule()
+    assert out.seqs[0] is a
+    assert waiting_selection_key("sjf", a, 0) < waiting_selection_key("sjf", b, 1)
+
+
+def test_sjf_selection_index_prefers_shortest():
     a = _seq(4000)
     b = _seq(100)
     c = _seq(500)
     waiting = deque([a, b, c])
     assert select_waiting_index("fcfs", waiting) == 0
-    assert remaining_prefill_score(b) < remaining_prefill_score(a)
+    assert select_waiting_index("sjf", waiting) == 1
+    waiting = deque([a, c])
+    assert select_waiting_index("sjf", waiting) == 1
+
+
+def test_sjf_total_bound_helper_exists_but_unused_by_default():
+    seq = _seq(100, max_tokens=50)
+    assert remaining_prefill_score(seq) == 100
+    assert sjf_total_bound_score(seq) == 150
 
 
 def test_fcfs_does_not_count_waiting_reorders():
@@ -94,3 +123,12 @@ def test_fcfs_does_not_count_waiting_reorders():
     sched.schedule()
     assert sched.metrics.waiting_reorders == 0
     assert sched.metrics.to_dict()["scheduler_policy"] == "fcfs"
+
+
+def test_sjf_counts_waiting_reorders_when_head_is_long():
+    sched = _make_scheduler(policy="sjf", max_batched_tokens=32, max_seqs=1)
+    sched.add(_seq(4000))
+    sched.add(_seq(100))
+    out = sched.schedule()
+    assert out.seqs[0].num_prompt_tokens == 100
+    assert sched.metrics.waiting_reorders >= 1

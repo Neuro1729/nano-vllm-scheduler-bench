@@ -234,7 +234,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=str,
         default="fcfs",
         choices=["fcfs", "sjf"],
-        help="WAITING admission policy (dev experiments; default fcfs matches parity). sjf enabled in follow-up.",
+        help="WAITING admission policy (dev experiments; default fcfs matches parity)",
     )
     return p.parse_args(argv)
 

@@ -70,9 +70,15 @@ def select_waiting_index(policy: SchedulerPolicyName, waiting: deque[Sequence]) 
         raise IndexError("waiting queue is empty")
     if policy == "fcfs":
         return 0
-    if policy == "sjf":
-        raise NotImplementedError("SJF waiting admission is enabled in a follow-up commit")
-    raise ValueError(f"unsupported scheduler_policy={policy!r}")
+    # Size-aware policies (SJF): lowest waiting_selection_key wins.
+    best_i = 0
+    best_key = waiting_selection_key(policy, waiting[0], 0)
+    for i in range(1, len(waiting)):
+        key = waiting_selection_key(policy, waiting[i], i)
+        if key < best_key:
+            best_i = i
+            best_key = key
+    return best_i
 
 
 def pop_waiting_at(waiting: deque[Sequence], index: int) -> Sequence:
