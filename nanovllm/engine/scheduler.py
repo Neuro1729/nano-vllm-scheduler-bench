@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from collections import deque
 from time import perf_counter
 from typing import TYPE_CHECKING
@@ -58,10 +59,80 @@ class Scheduler:
         elif output.is_decode_only:
             self.metrics.decode_iterations += 1
 
+    def _debug_enabled(self) -> bool:
+        return os.environ.get("NANOVLLM_SCHED_DEBUG", "").strip() not in {"", "0", "false", "False"}
+
+    def _format_schedule_debug(
+        self,
+        *,
+        token_budget: int,
+        scheduled_seqs: list[Sequence],
+        preempted_this_step: bool,
+        num_preempted: int,
+        num_skipped_waiting: int,
+    ) -> str:
+        return (
+            "scheduler empty-batch debug: "
+            f"token_budget={token_budget} "
+            f"len(running)={len(self.running)} "
+            f"len(waiting)={len(self.waiting)} "
+            f"free_kv_blocks={len(self.block_manager.free_block_ids)} "
+            f"used_kv_blocks={len(self.block_manager.used_block_ids)} "
+            f"scheduled_seqs={len(scheduled_seqs)} "
+            f"preempted_this_step={preempted_this_step} "
+            f"num_preempted={num_preempted} "
+            f"num_skipped_waiting={num_skipped_waiting} "
+            f"allocation_failures={self.metrics.allocation_failures}"
+        )
+
+    def _admit_from_waiting(
+        self,
+        scheduled_seqs: list[Sequence],
+        token_budget: int,
+    ) -> tuple[list[Sequence], int, int]:
+        """FCFS waiting admission with HOL skip. Returns skipped count."""
+        skipped: deque[Sequence] = deque()
+        num_skipped = 0
+        while (
+            self.waiting
+            and token_budget > 0
+            and len(scheduled_seqs) < self.max_num_seqs
+            and len(self.running) < self.max_num_seqs
+        ):
+            seq = self.waiting[0]
+            if not seq.block_table:
+                num_cached_blocks = self.block_manager.can_allocate(seq)
+                if num_cached_blocks == -1:
+                    self.metrics.allocation_failures += 1
+                    skipped.append(self.waiting.popleft())
+                    num_skipped += 1
+                    continue
+                self.block_manager.allocate(seq, num_cached_blocks)
+
+            need = seq.remaining_prefill_tokens
+            take = min(need, token_budget)
+            if take <= 0:
+                break
+
+            seq.num_scheduled_tokens = take
+            seq.is_prefill = True
+            token_budget -= take
+            self.waiting.popleft()
+            seq.status = SequenceStatus.RUNNING
+            self.running.append(seq)
+            scheduled_seqs.append(seq)
+            self._instrument_on_schedule(seq)
+
+        for seq in reversed(skipped):
+            self.waiting.appendleft(seq)
+        return scheduled_seqs, token_budget, num_skipped
+
     def schedule(self) -> SchedulerOutput:
         scheduled_seqs: list[Sequence] = []
         token_budget = self.max_num_batched_tokens
         preempted_this_step = False
+        num_preempted = 0
+        num_skipped_waiting = 0
 
         # INSTRUMENTATION-ONLY
         self.metrics.observe_queues(
@@ -93,13 +164,18 @@ class Scheduler:
                 continue
 
             # Decode: need one token of budget and possibly a new KV block.
+            # Preemption frees blocks; the while-loop retries can_append.
             while not self.block_manager.can_append(seq):
                 if pending_running:
                     self.preempt(pending_running.pop())
                     preempted_this_step = True
+                    num_preempted += 1
                 else:
+                    # Last resort: preempt self. KV is freed and seq returns to
+                    # waiting for recompute; do not count it as scheduled work.
                     self.preempt(seq)
                     preempted_this_step = True
+                    num_preempted += 1
                     seq = None
                     break
             if seq is None:
@@ -120,45 +196,38 @@ class Scheduler:
 
         # ------------------------------------------------------------------
         # 2) Fill remaining budget from WAITING (HOL skip on alloc failure).
-        #    Skip waiting admission if we preempted this step (avoid thrash).
+        #
+        # Anti-thrash: after a preemption that already produced model work,
+        # defer new waiting admits to the next iteration (vLLM-like).
+        #
+        # Liveness: if the batch is still empty after preemption, we MUST
+        # admit from waiting in this same step so freed KV can be used for
+        # recompute. Otherwise the engine would hit an empty-batch dead end.
         # ------------------------------------------------------------------
-        if not preempted_this_step:
-            skipped: deque[Sequence] = deque()
-            while (
-                self.waiting
-                and token_budget > 0
-                and len(scheduled_seqs) < self.max_num_seqs
-                and len(self.running) < self.max_num_seqs
-            ):
-                seq = self.waiting[0]
-                if not seq.block_table:
-                    num_cached_blocks = self.block_manager.can_allocate(seq)
-                    if num_cached_blocks == -1:
-                        # HOL skip: try later waiting requests.
-                        self.metrics.allocation_failures += 1
-                        skipped.append(self.waiting.popleft())
-                        continue
-                    self.block_manager.allocate(seq, num_cached_blocks)
+        # Anti-thrash: after preemption that already scheduled model work, defer
+        # new waiting admits (vLLM-like). Liveness: if the batch is still empty,
+        # always admit waiting so freed KV can be used for recompute immediately.
+        admit_waiting = (not preempted_this_step) or (not scheduled_seqs)
+        if admit_waiting:
+            scheduled_seqs, token_budget, num_skipped_waiting = self._admit_from_waiting(
+                scheduled_seqs, token_budget
+            )
 
-                need = seq.remaining_prefill_tokens
-                take = min(need, token_budget)
-                if take <= 0:
-                    break
+        if not scheduled_seqs:
+            msg = self._format_schedule_debug(
+                token_budget=token_budget,
+                scheduled_seqs=scheduled_seqs,
+                preempted_this_step=preempted_this_step,
+                num_preempted=num_preempted,
+                num_skipped_waiting=num_skipped_waiting,
+            )
+            if self._debug_enabled():
+                print(msg)
+            # Prefer a loud failure over an engine spin on perpetual empty batches.
+            raise RuntimeError(
+                "scheduler produced an empty batch with no schedulable tokens; " + msg
+            )
 
-                seq.num_scheduled_tokens = take
-                seq.is_prefill = True
-                token_budget -= take
-                self.waiting.popleft()
-                seq.status = SequenceStatus.RUNNING
-                self.running.append(seq)
-                scheduled_seqs.append(seq)
-                self._instrument_on_schedule(seq)
-
-            # Re-queue skipped requests at the front, preserving their relative order.
-            for seq in reversed(skipped):
-                self.waiting.appendleft(seq)
-
-        assert scheduled_seqs, "scheduler produced an empty batch"
         assert sum(s.num_scheduled_tokens for s in scheduled_seqs) <= self.max_num_batched_tokens
 
         output = SchedulerOutput(scheduled_seqs)

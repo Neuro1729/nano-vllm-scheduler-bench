@@ -62,6 +62,10 @@ class LLMEngine:
     def step(self):
         sched_out = self.scheduler.schedule()
         seqs = sched_out.seqs
+        # Liveness: scheduler may return an empty batch after a state-only step
+        # (e.g. preemption). Do not invoke the model with zero sequences.
+        if not seqs:
+            return [], 0
         # Throughput hint: positive => prefill tokens; negative => decode seq count.
         if sched_out.is_decode_only:
             num_tokens = -len(seqs)
