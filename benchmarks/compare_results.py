@@ -7,7 +7,10 @@ import argparse
 import json
 import sys
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
+
+
+Judgment = Literal["lower", "higher", "info"]
 
 
 def _get(d: dict[str, Any], dotted: str) -> Any:
@@ -31,7 +34,7 @@ def _fmt(value: Any) -> str:
     return str(value)
 
 
-def _change(real: Any, dev: Any, lower_is_better: bool) -> str:
+def _change(real: Any, dev: Any, judgment: Judgment) -> str:
     if real is None or dev is None:
         return "n/a"
     try:
@@ -42,10 +45,11 @@ def _change(real: Any, dev: Any, lower_is_better: bool) -> str:
     if real_f == 0:
         return "n/a"
     pct = (dev_f - real_f) / abs(real_f) * 100.0
-    # Annotate direction qualitatively without a single score.
-    if abs(pct) < 0.05:
+    if judgment == "info":
+        tip = "info"
+    elif abs(pct) < 0.05:
         tip = "same"
-    elif lower_is_better:
+    elif judgment == "lower":
         tip = "better" if pct < 0 else "worse"
     else:
         tip = "better" if pct > 0 else "worse"
@@ -53,70 +57,105 @@ def _change(real: Any, dev: Any, lower_is_better: bool) -> str:
     return f"{sign}{pct:.1f}% ({tip})"
 
 
-def _print_table(title: str, rows: list[tuple[str, Any, Any, bool]]) -> None:
+def _print_table(title: str, rows: list[tuple[str, Any, Any, Judgment]], note: str = "") -> None:
     print()
     print(title)
-    print(f"{'Metric':<28} {'real':>14} {'dev':>14} {'change':>22}")
-    print("-" * 80)
-    for name, real, dev, lower_is_better in rows:
+    if note:
+        print(f"  {note}")
+    print(f"{'Metric':<32} {'real':>14} {'dev':>14} {'change':>22}")
+    print("-" * 84)
+    for name, real, dev, judgment in rows:
         print(
-            f"{name:<28} {_fmt(real):>14} {_fmt(dev):>14} "
-            f"{_change(real, dev, lower_is_better):>22}"
+            f"{name:<32} {_fmt(real):>14} {_fmt(dev):>14} "
+            f"{_change(real, dev, judgment):>22}"
         )
 
 
-def _global_rows(real: dict, dev: dict) -> list[tuple[str, Any, Any, bool]]:
-    pairs = [
-        ("Output tok/s", "throughput.output_token_throughput_tok_s", False),
-        ("Prompt tok/s", "throughput.prompt_token_throughput_tok_s", False),
-        ("Total tok/s", "throughput.total_token_throughput_tok_s", False),
-        ("Request/s", "throughput.request_throughput_req_s", False),
-        ("Wall clock s", "throughput.wall_clock_time_s", True),
-        ("Mean TTFT ms", "latency.ttft_ms.mean", True),
-        ("P50 TTFT ms", "latency.ttft_ms.p50", True),
-        ("P95 TTFT ms", "latency.ttft_ms.p95", True),
-        ("P99 TTFT ms", "latency.ttft_ms.p99", True),
-        ("Mean TPOT ms", "latency.tpot_ms.mean", True),
-        ("P95 TPOT ms", "latency.tpot_ms.p95", True),
-        ("P99 TPOT ms", "latency.tpot_ms.p99", True),
-        ("Mean E2E ms", "latency.e2e_latency_ms.mean", True),
-        ("P95 E2E ms", "latency.e2e_latency_ms.p95", True),
-        ("P99 E2E ms", "latency.e2e_latency_ms.p99", True),
-        ("Preemptions", "scheduler.preemption_count", True),
-        ("Preempted requests", "scheduler.preempted_requests", True),
-        ("Recomputed tokens", "scheduler.recomputed_tokens", True),
-        ("Alloc failures", "scheduler.allocation_failures", True),
-        ("Mixed iterations", "scheduler.mixed_iterations", False),
-        ("Prefill iterations", "scheduler.prefill_iterations", False),
-        ("Decode iterations", "scheduler.decode_iterations", False),
-        ("Sched prefill toks", "scheduler.scheduled_prefill_tokens", False),
-        ("Sched decode toks", "scheduler.scheduled_decode_tokens", False),
-        ("Chunked prefills", "scheduler.chunked_prefill_count", False),
-        ("Peak KV util", "scheduler.peak_KV_utilization", True),
-        ("Avg KV util", "scheduler.average_KV_utilization", False),
-    ]
-    rows = []
-    for name, path, lower in pairs:
-        rows.append((name, _get(real, path), _get(dev, path), lower))
-    return rows
+def _rows(real: dict, dev: dict, pairs: list[tuple[str, str, Judgment]]) -> list[tuple[str, Any, Any, Judgment]]:
+    return [(name, _get(real, path), _get(dev, path), judgment) for name, path, judgment in pairs]
 
 
-def _class_rows(real: dict, dev: dict, cls: str) -> list[tuple[str, Any, Any, bool]]:
+def _global_pressure_rows(real: dict, dev: dict) -> list[tuple[str, Any, Any, Judgment]]:
+    """Cross-branch-comparable KV / preemption pressure metrics."""
+    return _rows(
+        real,
+        dev,
+        [
+            ("Alloc failure steps", "scheduler.allocation_failure_steps", "lower"),
+            ("Preemptions", "scheduler.preemption_count", "lower"),
+            ("Preempted requests", "scheduler.preempted_requests", "lower"),
+            ("Recomputed tokens", "scheduler.recomputed_tokens", "lower"),
+            ("Peak KV util", "scheduler.peak_KV_utilization", "lower"),
+            ("Avg KV util", "scheduler.average_KV_utilization", "info"),
+            ("Peak KV blocks used", "scheduler.peak_KV_blocks_used", "info"),
+        ],
+    )
+
+
+def _global_alloc_scan_rows(real: dict, dev: dict) -> list[tuple[str, Any, Any, Judgment]]:
+    """Policy-dependent allocation scan counts; do not treat as better/worse."""
+    return _rows(
+        real,
+        dev,
+        [
+            ("Alloc failed candidates", "scheduler.allocation_failed_candidates", "info"),
+            ("HOL skipped requests", "scheduler.hol_skipped_requests", "info"),
+            ("Waiting candidates examined", "scheduler.waiting_candidates_examined", "info"),
+            ("Alloc candidate fail rate", "scheduler.allocation_candidate_failure_rate", "info"),
+            ("Alloc failures (legacy)", "scheduler.allocation_failures", "info"),
+        ],
+    )
+
+
+def _global_perf_rows(real: dict, dev: dict) -> list[tuple[str, Any, Any, Judgment]]:
+    return _rows(
+        real,
+        dev,
+        [
+            ("Output tok/s", "throughput.output_token_throughput_tok_s", "higher"),
+            ("Prompt tok/s", "throughput.prompt_token_throughput_tok_s", "higher"),
+            ("Total tok/s", "throughput.total_token_throughput_tok_s", "higher"),
+            ("Request/s", "throughput.request_throughput_req_s", "higher"),
+            ("Wall clock s", "throughput.wall_clock_time_s", "lower"),
+            ("Mean TTFT ms", "latency.ttft_ms.mean", "lower"),
+            ("P50 TTFT ms", "latency.ttft_ms.p50", "lower"),
+            ("P95 TTFT ms", "latency.ttft_ms.p95", "lower"),
+            ("P99 TTFT ms", "latency.ttft_ms.p99", "lower"),
+            ("Mean TPOT ms", "latency.tpot_ms.mean", "lower"),
+            ("P95 TPOT ms", "latency.tpot_ms.p95", "lower"),
+            ("P99 TPOT ms", "latency.tpot_ms.p99", "lower"),
+            ("Mean E2E ms", "latency.e2e_latency_ms.mean", "lower"),
+            ("P95 E2E ms", "latency.e2e_latency_ms.p95", "lower"),
+            ("P99 E2E ms", "latency.e2e_latency_ms.p99", "lower"),
+            ("Mixed iterations", "scheduler.mixed_iterations", "info"),
+            ("Prefill iterations", "scheduler.prefill_iterations", "info"),
+            ("Decode iterations", "scheduler.decode_iterations", "info"),
+            ("Sched prefill toks", "scheduler.scheduled_prefill_tokens", "info"),
+            ("Sched decode toks", "scheduler.scheduled_decode_tokens", "info"),
+            ("Chunked prefills", "scheduler.chunked_prefill_count", "info"),
+        ],
+    )
+
+
+def _class_rows(real: dict, dev: dict, cls: str) -> list[tuple[str, Any, Any, Judgment]]:
     base = f"classes.{cls}"
-    pairs = [
-        ("Mean TTFT ms", f"{base}.latency.ttft_ms.mean", True),
-        ("P50 TTFT ms", f"{base}.latency.ttft_ms.p50", True),
-        ("P95 TTFT ms", f"{base}.latency.ttft_ms.p95", True),
-        ("P99 TTFT ms", f"{base}.latency.ttft_ms.p99", True),
-        ("Mean TPOT ms", f"{base}.latency.tpot_ms.mean", True),
-        ("P99 TPOT ms", f"{base}.latency.tpot_ms.p99", True),
-        ("Mean E2E ms", f"{base}.latency.e2e_latency_ms.mean", True),
-        ("P95 E2E ms", f"{base}.latency.e2e_latency_ms.p95", True),
-        ("Output tok/s", f"{base}.throughput.output_token_throughput_tok_s", False),
-        ("Preemptions", f"{base}.scheduler.preemption_count", True),
-        ("Recomputed tokens", f"{base}.scheduler.recomputed_tokens", True),
-    ]
-    return [(n, _get(real, p), _get(dev, p), low) for n, p, low in pairs]
+    return _rows(
+        real,
+        dev,
+        [
+            ("Mean TTFT ms", f"{base}.latency.ttft_ms.mean", "lower"),
+            ("P50 TTFT ms", f"{base}.latency.ttft_ms.p50", "lower"),
+            ("P95 TTFT ms", f"{base}.latency.ttft_ms.p95", "lower"),
+            ("P99 TTFT ms", f"{base}.latency.ttft_ms.p99", "lower"),
+            ("Mean TPOT ms", f"{base}.latency.tpot_ms.mean", "lower"),
+            ("P99 TPOT ms", f"{base}.latency.tpot_ms.p99", "lower"),
+            ("Mean E2E ms", f"{base}.latency.e2e_latency_ms.mean", "lower"),
+            ("P95 E2E ms", f"{base}.latency.e2e_latency_ms.p95", "lower"),
+            ("Output tok/s", f"{base}.throughput.output_token_throughput_tok_s", "higher"),
+            ("Preemptions", f"{base}.scheduler.preemption_count", "lower"),
+            ("Recomputed tokens", f"{base}.scheduler.recomputed_tokens", "lower"),
+        ],
+    )
 
 
 def compare(real_path: Path, dev_path: Path) -> int:
@@ -138,7 +177,20 @@ def compare(real_path: Path, dev_path: Path) -> int:
     if _get(real, "metadata.gpu_name") != _get(dev, "metadata.gpu_name"):
         print("WARNING: GPU models differ; run crossover swap before drawing conclusions.")
 
-    _print_table("Global metrics", _global_rows(real, dev))
+    _print_table(
+        "KV / preemption pressure (cross-branch comparable)",
+        _global_pressure_rows(real, dev),
+        note="Prefer these for real vs parity pressure comparisons.",
+    )
+    _print_table(
+        "Allocation scan diagnostics (policy-dependent; not better/worse)",
+        _global_alloc_scan_rows(real, dev),
+        note=(
+            "failed_candidates/hol_skipped reflect admit scan policy; "
+            "parity HOL-skip can legitimately inflate them vs real."
+        ),
+    )
+    _print_table("Throughput / latency / batch mix", _global_perf_rows(real, dev))
 
     classes = sorted(set(real.get("classes", {})) | set(dev.get("classes", {})))
     for cls in classes:

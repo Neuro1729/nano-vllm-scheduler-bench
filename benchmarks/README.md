@@ -102,4 +102,16 @@ Minimal hooks in:
 - `nanovllm/engine/block_manager.py` (`clear_prefix_cache` helper)
 - `nanovllm/engine/llm_engine.py` (optional request metadata kwargs)
 
+Allocation metrics (waiting admit, `can_allocate == -1` only):
+
+| Field | Meaning | Cross-branch |
+|-------|---------|--------------|
+| `allocation_failure_steps` | Iterations with ≥1 waiting alloc failure | Comparable |
+| `allocation_failed_candidates` | Waiting requests that failed alloc | Parity may be higher (HOL skip) |
+| `hol_skipped_requests` | Waiting requests skipped to continue scan | ~0 on real |
+| `waiting_candidates_examined` | Waiting heads inspected | Policy-dependent |
+| `allocation_failures` | Legacy alias of failed-candidate hits | Not comparable raw |
+
+Prefer `allocation_failure_steps`, preemptions, recomputed tokens, and KV util for pressure comparisons.
+
 TTFT / TPOT / E2E definitions are unchanged across branches.

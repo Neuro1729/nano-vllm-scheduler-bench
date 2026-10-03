@@ -107,6 +107,9 @@ def test_hol_skip_blocked_waiting_head():
     assert ok in out.seqs
     assert blocked in sched.waiting  # re-queued after skip
     assert sched.metrics.allocation_failures >= 1
+    assert sched.metrics.allocation_failure_steps >= 1
+    assert sched.metrics.allocation_failed_candidates >= 1
+    assert sched.metrics.hol_skipped_requests >= 1
 
 
 def test_decode_progress_while_long_prefill_present():

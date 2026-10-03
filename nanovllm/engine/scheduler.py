@@ -118,7 +118,10 @@ class Scheduler:
             f"preempted_this_step={preempted_this_step} "
             f"num_preempted={num_preempted} "
             f"num_skipped_waiting={num_skipped_waiting} "
-            f"allocation_failures={self.metrics.allocation_failures}"
+            f"allocation_failures={self.metrics.allocation_failures} "
+            f"allocation_failure_steps={self.metrics.allocation_failure_steps} "
+            f"allocation_failed_candidates={self.metrics.allocation_failed_candidates} "
+            f"hol_skipped_requests={self.metrics.hol_skipped_requests}"
         )
         return base + "\n" + self._waiting_state_dump()
 
@@ -137,10 +140,11 @@ class Scheduler:
             and len(self.running) < self.max_num_seqs
         ):
             seq = self.waiting[0]
+            self.metrics.examine_waiting_candidate()
             if not seq.block_table:
                 num_cached_blocks = self.block_manager.can_allocate(seq)
                 if num_cached_blocks == -1:
-                    self.metrics.allocation_failures += 1
+                    self.metrics.record_allocation_failure(hol_skipped=True)
                     skipped.append(self.waiting.popleft())
                     num_skipped += 1
                     continue
@@ -234,6 +238,7 @@ class Scheduler:
         num_skipped_waiting = 0
 
         # INSTRUMENTATION-ONLY
+        self.metrics.begin_iteration()
         self.metrics.observe_queues(
             len(self.waiting),
             len(self.running),
