@@ -1,10 +1,15 @@
+from __future__ import annotations
+
 from collections import deque
 from time import perf_counter
+from typing import TYPE_CHECKING
 
-from nanovllm.config import Config
 from nanovllm.engine.sequence import Sequence, SequenceStatus
 from nanovllm.engine.block_manager import BlockManager
 from nanovllm.engine.scheduler_metrics import SchedulerMetrics
+
+if TYPE_CHECKING:
+    from nanovllm.config import Config
 
 
 class Scheduler:
@@ -45,7 +50,28 @@ class Scheduler:
             len(self.block_manager.used_block_ids),
         )
 
-        # prefill
+        # Prefill: continue in-progress running chunks, then admit from waiting.
+        # Partial prefills live in `running` (parity accounting); exclusive phase
+        # still returns before decode (mixed batches arrive in a later milestone).
+        running_prefills = deque(seq for seq in self.running if seq.is_prefill_chunk)
+        self.running = deque(seq for seq in self.running if not seq.is_prefill_chunk)
+
+        while running_prefills and len(scheduled_seqs) < self.max_num_seqs:
+            seq = running_prefills[0]
+            remaining = self.max_num_batched_tokens - num_batched_tokens
+            if remaining == 0:
+                break
+            num_tokens = seq.remaining_prefill_tokens
+            if remaining < num_tokens and scheduled_seqs:  # only allow chunked prefill for the first seq
+                break
+            running_prefills.popleft()
+            seq.num_scheduled_tokens = min(num_tokens, remaining)
+            seq.is_prefill = True
+            num_batched_tokens += seq.num_scheduled_tokens
+            self.running.append(seq)
+            self._instrument_on_schedule(seq)
+            scheduled_seqs.append(seq)
+
         while self.waiting and len(scheduled_seqs) < self.max_num_seqs:
             seq = self.waiting[0]
             remaining = self.max_num_batched_tokens - num_batched_tokens
@@ -59,19 +85,23 @@ class Scheduler:
                     break
                 num_tokens = seq.num_tokens - num_cached_blocks * self.block_size
             else:
-                num_tokens = seq.num_tokens - seq.num_cached_tokens
+                num_tokens = seq.remaining_prefill_tokens
             if remaining < num_tokens and scheduled_seqs:  # only allow chunked prefill for the first seq
                 break
             if not seq.block_table:
                 self.block_manager.allocate(seq, num_cached_blocks)
             seq.num_scheduled_tokens = min(num_tokens, remaining)
+            seq.is_prefill = True
             num_batched_tokens += seq.num_scheduled_tokens
-            if seq.num_cached_tokens + seq.num_scheduled_tokens == seq.num_tokens:
-                seq.status = SequenceStatus.RUNNING
-                self.waiting.popleft()
-                self.running.append(seq)
+            self.waiting.popleft()
+            # Admitted prefills (full or partial) become running immediately.
+            seq.status = SequenceStatus.RUNNING
+            self.running.append(seq)
             self._instrument_on_schedule(seq)
             scheduled_seqs.append(seq)
+
+        # Keep unscheduled in-progress prefills in running.
+        self.running.extend(running_prefills)
 
         if scheduled_seqs:
             # INSTRUMENTATION-ONLY
@@ -79,9 +109,13 @@ class Scheduler:
             self.metrics.prefill_iterations += 1
             return scheduled_seqs, True
 
-        # decode
+        # decode (only sequences that finished prompt prefill)
         while self.running and len(scheduled_seqs) < self.max_num_seqs:
             seq = self.running.popleft()
+            if seq.is_prefill_chunk:
+                # Should not happen after the prefill pass drained chunks; keep safe.
+                self.running.append(seq)
+                break
             while not self.block_manager.can_append(seq):
                 if self.running:
                     self.preempt(self.running.pop())
@@ -121,8 +155,10 @@ class Scheduler:
             self.block_manager.hash_blocks(seq)
             seq.num_cached_tokens += seq.num_scheduled_tokens
             seq.num_scheduled_tokens = 0
-            if is_prefill and seq.num_cached_tokens < seq.num_tokens:
+            # Prefer computed-token accounting; keep is_prefill arg for API compat.
+            if seq.is_prefill_chunk or (is_prefill and seq.num_cached_tokens < seq.num_tokens):
                 continue
+            seq.is_prefill = False
             seq.append_token(token_id)
             # INSTRUMENTATION-ONLY
             if seq.first_token_time == 0.0:

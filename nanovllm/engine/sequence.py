@@ -22,7 +22,7 @@ class Sequence:
         self.last_token = token_ids[-1]
         self.num_tokens = len(self.token_ids)
         self.num_prompt_tokens = len(token_ids)
-        self.num_cached_tokens = 0
+        self.num_cached_tokens = 0  # tokens with KV written (= num_computed_tokens)
         self.num_scheduled_tokens = 0
         self.is_prefill = True
         self.block_table = []
@@ -51,6 +51,24 @@ class Sequence:
     @property
     def is_finished(self):
         return self.status == SequenceStatus.FINISHED
+
+    @property
+    def num_computed_tokens(self) -> int:
+        """Tokens whose KV is already in the cache (alias of num_cached_tokens)."""
+        return self.num_cached_tokens
+
+    @num_computed_tokens.setter
+    def num_computed_tokens(self, value: int) -> None:
+        self.num_cached_tokens = value
+
+    @property
+    def is_prefill_chunk(self) -> bool:
+        """True while prompt KV is incomplete (admitted partial / in-progress prefill)."""
+        return self.num_computed_tokens < self.num_prompt_tokens
+
+    @property
+    def remaining_prefill_tokens(self) -> int:
+        return max(0, self.num_prompt_tokens - self.num_computed_tokens)
 
     @property
     def num_completion_tokens(self):
