@@ -192,6 +192,9 @@ def run_once(
         "prefix_cache_policy": "cleared_between_runs; distinct synthetic prompts",
         "scheduler_policy": getattr(llm.config, "scheduler_policy", "fcfs"),
         "scheduler_aging_threshold": getattr(llm.config, "scheduler_aging_threshold", 128),
+        "mlfq_q0_quantum": getattr(llm.config, "mlfq_q0_quantum", 256),
+        "mlfq_q1_quantum": getattr(llm.config, "mlfq_q1_quantum", 1024),
+        "mlfq_boost_interval": getattr(llm.config, "mlfq_boost_interval", 256),
     }
     config = {
         "max_model_len": llm.config.max_model_len,
@@ -204,6 +207,9 @@ def run_once(
         "num_kvcache_blocks": llm.config.num_kvcache_blocks,
         "scheduler_policy": getattr(llm.config, "scheduler_policy", "fcfs"),
         "scheduler_aging_threshold": getattr(llm.config, "scheduler_aging_threshold", 128),
+        "mlfq_q0_quantum": getattr(llm.config, "mlfq_q0_quantum", 256),
+        "mlfq_q1_quantum": getattr(llm.config, "mlfq_q1_quantum", 1024),
+        "mlfq_boost_interval": getattr(llm.config, "mlfq_boost_interval", 256),
         "scaled_workload_ranges": describe_scaled_ranges(llm.config.max_model_len),
     }
     return build_result(
@@ -235,14 +241,22 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--scheduler-policy",
         type=str,
         default="fcfs",
-        choices=["fcfs", "sjf", "sjf_aging"],
-        help="WAITING admission policy (dev experiments; default fcfs matches parity)",
+        choices=["fcfs", "sjf", "sjf_aging", "mlfq"],
+        help="Scheduler policy (dev experiments; default fcfs matches parity)",
     )
     p.add_argument(
         "--aging-threshold",
         type=int,
         default=128,
         help="For sjf_aging: waiting-age steps before starvation promotion (default 128)",
+    )
+    p.add_argument("--mlfq-q0-quantum", type=int, default=256, help="MLFQ Q0 token quantum")
+    p.add_argument("--mlfq-q1-quantum", type=int, default=1024, help="MLFQ Q1 token quantum")
+    p.add_argument(
+        "--mlfq-boost-interval",
+        type=int,
+        default=256,
+        help="MLFQ priority boost every N scheduler iterations (0 disables)",
     )
     return p.parse_args(argv)
 
@@ -261,11 +275,18 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.aging_threshold < 1:
         raise SystemExit("--aging-threshold must be >= 1")
+    if args.mlfq_q0_quantum < 1 or args.mlfq_q1_quantum < 1:
+        raise SystemExit("--mlfq-q0-quantum and --mlfq-q1-quantum must be >= 1")
+    if args.mlfq_boost_interval < 0:
+        raise SystemExit("--mlfq-boost-interval must be >= 0")
 
     llm_kwargs = {
         "enforce_eager": args.enforce_eager,
         "scheduler_policy": args.scheduler_policy,
         "scheduler_aging_threshold": args.aging_threshold,
+        "mlfq_q0_quantum": args.mlfq_q0_quantum,
+        "mlfq_q1_quantum": args.mlfq_q1_quantum,
+        "mlfq_boost_interval": args.mlfq_boost_interval,
     }
     if args.max_model_len is not None:
         llm_kwargs["max_model_len"] = args.max_model_len

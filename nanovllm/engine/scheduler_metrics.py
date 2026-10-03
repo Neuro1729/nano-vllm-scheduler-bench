@@ -42,6 +42,26 @@ class SchedulerMetrics:
     # Policy name / threshold copied from Config for benchmark JSON.
     scheduler_policy: str = "fcfs"
     scheduler_aging_threshold: int = 128
+    # MLFQ config mirror + counters
+    mlfq_q0_quantum: int = 256
+    mlfq_q1_quantum: int = 1024
+    mlfq_boost_interval: int = 256
+    mlfq_q0_service_tokens: int = 0
+    mlfq_q1_service_tokens: int = 0
+    mlfq_q2_service_tokens: int = 0
+    mlfq_q0_admissions: int = 0
+    mlfq_q1_demotions: int = 0
+    mlfq_q2_demotions: int = 0
+    mlfq_priority_boosts: int = 0
+    mlfq_requests_boosted: int = 0
+    mlfq_max_q0_size: int = 0
+    mlfq_max_q1_size: int = 0
+    mlfq_max_q2_size: int = 0
+    completed_in_q0: int = 0
+    completed_in_q1: int = 0
+    completed_in_q2: int = 0
+    _completion_level_sum: int = 0
+    _completion_level_count: int = 0
     peak_kv_blocks_used: int = 0
     peak_kv_utilization: float = 0.0
     _kv_util_sum: float = 0.0
@@ -71,7 +91,23 @@ class SchedulerMetrics:
         self.max_waiting_age_steps = 0
         self._admission_age_sum = 0
         self._admission_age_count = 0
-        # Keep scheduler_policy / threshold across reset (config-level attributes).
+        self.mlfq_q0_service_tokens = 0
+        self.mlfq_q1_service_tokens = 0
+        self.mlfq_q2_service_tokens = 0
+        self.mlfq_q0_admissions = 0
+        self.mlfq_q1_demotions = 0
+        self.mlfq_q2_demotions = 0
+        self.mlfq_priority_boosts = 0
+        self.mlfq_requests_boosted = 0
+        self.mlfq_max_q0_size = 0
+        self.mlfq_max_q1_size = 0
+        self.mlfq_max_q2_size = 0
+        self.completed_in_q0 = 0
+        self.completed_in_q1 = 0
+        self.completed_in_q2 = 0
+        self._completion_level_sum = 0
+        self._completion_level_count = 0
+        # Keep policy/config mirrors across reset.
         self.peak_kv_blocks_used = 0
         self.peak_kv_utilization = 0.0
         self._kv_util_sum = 0.0
@@ -109,6 +145,38 @@ class SchedulerMetrics:
         if hol_skipped:
             self.hol_skipped_requests += 1
 
+    def observe_mlfq_queue_sizes(self, q0: int, q1: int, q2: int) -> None:
+        self.mlfq_max_q0_size = max(self.mlfq_max_q0_size, q0)
+        self.mlfq_max_q1_size = max(self.mlfq_max_q1_size, q1)
+        self.mlfq_max_q2_size = max(self.mlfq_max_q2_size, q2)
+
+    def record_mlfq_service(self, level: int, tokens: int) -> None:
+        if tokens <= 0:
+            return
+        if level == 0:
+            self.mlfq_q0_service_tokens += tokens
+        elif level == 1:
+            self.mlfq_q1_service_tokens += tokens
+        else:
+            self.mlfq_q2_service_tokens += tokens
+
+    def record_mlfq_demotion(self, new_level: int) -> None:
+        if new_level == 1:
+            self.mlfq_q1_demotions += 1
+        elif new_level == 2:
+            self.mlfq_q2_demotions += 1
+
+    def record_completion_level(self, level: int) -> None:
+        level = max(0, min(2, level))
+        self._completion_level_sum += level
+        self._completion_level_count += 1
+        if level == 0:
+            self.completed_in_q0 += 1
+        elif level == 1:
+            self.completed_in_q1 += 1
+        else:
+            self.completed_in_q2 += 1
+
     def observe_queues(self, num_waiting: int, num_running: int, used_blocks: int) -> None:
         self.max_waiting_requests = max(self.max_waiting_requests, num_waiting)
         self.max_running_requests = max(self.max_running_requests, num_running)
@@ -136,6 +204,12 @@ class SchedulerMetrics:
             return 0.0
         return self._admission_age_sum / self._admission_age_count
 
+    @property
+    def mean_completion_level(self) -> float:
+        if self._completion_level_count == 0:
+            return 0.0
+        return self._completion_level_sum / self._completion_level_count
+
     def to_dict(self) -> dict:
         return {
             "scheduler_iterations": self.scheduler_iterations,
@@ -161,6 +235,24 @@ class SchedulerMetrics:
             "mean_age_at_admission": self.mean_age_at_admission,
             "scheduler_policy": self.scheduler_policy,
             "scheduler_aging_threshold": self.scheduler_aging_threshold,
+            "mlfq_q0_quantum": self.mlfq_q0_quantum,
+            "mlfq_q1_quantum": self.mlfq_q1_quantum,
+            "mlfq_boost_interval": self.mlfq_boost_interval,
+            "mlfq_q0_service_tokens": self.mlfq_q0_service_tokens,
+            "mlfq_q1_service_tokens": self.mlfq_q1_service_tokens,
+            "mlfq_q2_service_tokens": self.mlfq_q2_service_tokens,
+            "mlfq_q0_admissions": self.mlfq_q0_admissions,
+            "mlfq_q1_demotions": self.mlfq_q1_demotions,
+            "mlfq_q2_demotions": self.mlfq_q2_demotions,
+            "mlfq_priority_boosts": self.mlfq_priority_boosts,
+            "mlfq_requests_boosted": self.mlfq_requests_boosted,
+            "mlfq_max_q0_size": self.mlfq_max_q0_size,
+            "mlfq_max_q1_size": self.mlfq_max_q1_size,
+            "mlfq_max_q2_size": self.mlfq_max_q2_size,
+            "completed_in_q0": self.completed_in_q0,
+            "completed_in_q1": self.completed_in_q1,
+            "completed_in_q2": self.completed_in_q2,
+            "mean_completion_level": self.mean_completion_level,
             "allocation_candidate_failure_rate": self.allocation_candidate_failure_rate,
             "peak_KV_blocks_used": self.peak_kv_blocks_used,
             "average_KV_utilization": self.average_kv_utilization,

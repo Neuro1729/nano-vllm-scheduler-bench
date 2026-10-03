@@ -33,6 +33,10 @@ class Sequence:
         # Starts at 0 on enter WAITING; +1 each schedule() while still waiting;
         # resets on admit to RUNNING; restarts at 0 on recompute preemption re-entry.
         self.waiting_age_steps = 0
+        # MLFQ state (mlfq policy only). Level 0=highest. Service is scheduled tokens.
+        self.mlfq_level = 0
+        self.mlfq_service_in_level = 0
+        self.mlfq_wait_steps = 0
         # INSTRUMENTATION-ONLY: unused by scheduling decisions
         self.workload_class = "unknown"
         self.arrival_time = 0.0

@@ -1,83 +1,63 @@
 # Experimental scheduler policies (`dev`)
 
-`real` and `parity` stay frozen. `dev` = parity + pluggable WAITING admission.
+`real` and `parity` stay frozen. `dev` = parity + experimental policies.
+
+## Policy summary
+
+| Policy | Idea |
+|--------|------|
+| **FCFS** | Arrival-order baseline (parity WAITING queue + running-first) |
+| **SJF** | Uses **known** remaining compute (`num_tokens - num_computed`) |
+| **SJF+Aging** | SJF plus starvation prevention by waiting-age threshold |
+| **MLFQ** | Does **not** know job size; infers behavior from **scheduled-token** service |
+
+Do not claim MLFQ is better until GPU results exist.
 
 ## Config
 
 ```text
---scheduler-policy fcfs|sjf|sjf_aging   (default: fcfs)
---aging-threshold N                    (default: 128; used by sjf_aging)
+--scheduler-policy fcfs|sjf|sjf_aging|mlfq   (default: fcfs)
+--aging-threshold N                          (default: 128; sjf_aging)
+--mlfq-q0-quantum 256
+--mlfq-q1-quantum 1024
+--mlfq-boost-interval 256                    (0 disables boost)
 ```
 
-`fcfs` must match parity waiting-queue order. `sjf` only reorders WAITING admission.
-`sjf_aging` is SJF with bounded-wait starvation promotion.
-
-### Waiting age (`sjf_aging`)
-
-| Event | Age effect |
-|-------|------------|
-| Enter WAITING (`add`) | start at 0 |
-| Each `schedule()` while still WAITING | `+1` (after running pass, before admit) |
-| HOL skip / lose SJF contest | age **kept** (not reset) |
-| Admitted to RUNNING | reset to 0 |
-| Recompute preemption back to WAITING | **restart at 0** (new continuous spell) |
-
-Age is scheduler iterations, not wall-clock. Restart-on-preempt keeps the metric equal to the current waiting spell and avoids carrying stale age across successful service.
-
-## SJF score (implemented)
+## SJF score
 
 ```text
 score = remaining_prefill_tokens
       = max(0, num_tokens - num_computed_tokens)   # while prefill/recompute
 ```
 
-Known current KV work only. Not total request length. Future decode length is unknown.
+## Waiting age (`sjf_aging`)
 
-Optional later (not default): `sjf_total_bound = remaining_prefill + remaining max_tokens`.
+| Event | Age effect |
+|-------|------------|
+| Enter WAITING (`add`) | start at 0 |
+| Each `schedule()` while still WAITING | `+1` |
+| HOL skip / lose SJF contest | age **kept** |
+| Admitted to RUNNING | reset to 0 |
+| Recompute preemption back to WAITING | **restart at 0** |
 
-Tie-break: lower `seq_id`. No aging in v1 (starvation of long work is intentional to observe).
+## MLFQ (implemented)
 
-Non-preemptive: never preempt RUNNING just because a shorter request arrives (not SRTF).
+Three levels: Q0 (highest) → Q1 → Q2 (bottom).
 
-## Round-robin analysis (not implemented)
+- New requests start in **Q0**.
+- Service = scheduled tokens (prefill + decode).
+- Exhaust Q0 quantum → demote to Q1; exhaust Q1 → Q2; Q2 does not demote.
+- Prefill chunks are clipped to **remaining quantum** (cannot silently burn multiple levels in one slice).
+- Within a level: deterministic round-robin (deque rotate across `schedule()` calls).
+- Higher levels are fully preferred while they have eligible work.
+- Demotion is priority-only: **no** KV free / recompute.
+- Every `mlfq_boost_interval` scheduler iterations, unfinished requests return to Q0 (KV kept).
+- True KV-pressure preemption **retains** `mlfq_level` and `mlfq_service_in_level`.
 
-Parity running-first decode already gives each scheduled decode sequence **one token per iteration** when it fits in the shared token budget and `max_num_seqs`. The running deque is drained front-to-back and survivors are appended again, so over iterations decode residents rotate through the batch much like **token-granularity RR** among RUNNING decodes.
-
-A classic RR “time quantum” does not map cleanly to LLM inference: the natural quantum is already one decode token (or one prefill chunk up to the token budget). Implementing another RR layer would only matter if we introduced multi-token decode quanta, priority against prefill chunks, or per-request token caps inside a step. Until then, a separate RR policy is unlikely to be distinct from parity’s running loop.
-
-## SRTF design (analysis only)
-
-| | SJF (this milestone) | SRTF |
-|--|----------------------|------|
-| Scope | Choose shortest WAITING work at admit | Newly shorter work may outrank/preempt RUNNING |
-| Preemption | KV-pressure recompute only | Also policy-driven preemption |
-
-LLM cost of naive SRTF is high vs CPU context switch:
-
-- Destroying KV forces recompute of prior tokens
-- Prefill/recompute burns compute and can thrash under load
-- Prefix cache may soften recompute but is not free and is workload-dependent
-- Preempting a nearly-done decode can inflate E2E and recomputed_tokens
-
-Any SRTF experiment should track preemptions, recomputed tokens, and tail E2E, and likely use non-destructive pause (keep KV) or high preemption thresholds rather than always deallocating.
-
-## MLFQ design (analysis only)
-
-Map OS multilevel feedback onto token-service, not workload class labels:
+Recommended first GPU baseline:
 
 ```text
-Q0: new / little service consumed
-Q1: moderate tokens scheduled so far
-Q2: long-running (many tokens scheduled)
+Q0=256, Q1=1024, boost=256
 ```
 
-Service metric candidates: `num_scheduler_steps`, scheduled token sum, or decode tokens emitted.
-
-Mechanics to consider later:
-
-- Demote after consuming a token quantum
-- Age/promote to prevent starvation in low-priority queues
-- Prefill chunks vs decode tokens may need different quanta (prefill is bursty)
-- Still separate from KV-pressure preemption
-
-Do not implement MLFQ until SJF baseline results exist.
+Compare on seed 42 against FCFS, SJF, and SJF+Aging-64.

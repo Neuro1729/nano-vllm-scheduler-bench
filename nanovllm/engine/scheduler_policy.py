@@ -26,6 +26,12 @@ SJF+aging (``sjf_aging``)
 Same SJF score, but if any WAITING request has ``waiting_age_steps >= threshold``,
 admit the oldest overdue request instead (starvation guard). Age is counted in
 scheduler iterations, not wall-clock time. See Sequence.waiting_age_steps.
+
+MLFQ (``mlfq``)
+---------------
+Feedback queues over scheduled-token service (not known job size). Waiting
+admission for MLFQ uses FCFS only to enter residency; priority/RR is applied
+in the MLFQ schedule path across RUNNING and newly admitted work.
 """
 
 from __future__ import annotations
@@ -36,8 +42,8 @@ from typing import Literal
 
 from nanovllm.engine.sequence import Sequence
 
-SchedulerPolicyName = Literal["fcfs", "sjf", "sjf_aging"]
-VALID_SCHEDULER_POLICIES: frozenset[str] = frozenset({"fcfs", "sjf", "sjf_aging"})
+SchedulerPolicyName = Literal["fcfs", "sjf", "sjf_aging", "mlfq"]
+VALID_SCHEDULER_POLICIES: frozenset[str] = frozenset({"fcfs", "sjf", "sjf_aging", "mlfq"})
 
 
 def normalize_scheduler_policy(name: str) -> SchedulerPolicyName:
@@ -87,7 +93,8 @@ def select_waiting_choice(
     """Choose the next WAITING candidate under ``policy``."""
     if not waiting:
         raise IndexError("waiting queue is empty")
-    if policy == "fcfs":
+    if policy in ("fcfs", "mlfq"):
+        # MLFQ prioritizes in the dedicated schedule path; residency admit is FCFS.
         return WaitingChoice(0, False)
 
     if policy == "sjf_aging":

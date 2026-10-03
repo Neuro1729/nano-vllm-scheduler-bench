@@ -14,13 +14,14 @@ from nanovllm.engine.scheduler_policy import (
     pop_waiting_at,
     select_waiting_choice,
 )
+from nanovllm.engine import mlfq as mlfq_lib
 
 if TYPE_CHECKING:
     from nanovllm.config import Config
 
 
 class Scheduler:
-    """vLLM-V1-style shared token-budget scheduler with pluggable WAITING policy."""
+    """vLLM-V1-style shared token-budget scheduler with pluggable policies."""
 
     def __init__(self, config: Config):
         self.max_num_seqs = config.max_num_seqs
@@ -31,19 +32,34 @@ class Scheduler:
             getattr(config, "scheduler_policy", "fcfs")
         )
         self.scheduler_aging_threshold = int(getattr(config, "scheduler_aging_threshold", 128))
+        self.mlfq_q0_quantum = int(getattr(config, "mlfq_q0_quantum", 256))
+        self.mlfq_q1_quantum = int(getattr(config, "mlfq_q1_quantum", 1024))
+        self.mlfq_boost_interval = int(getattr(config, "mlfq_boost_interval", 256))
         self.block_manager = BlockManager(config.num_kvcache_blocks, config.kvcache_block_size)
         self.waiting: deque[Sequence] = deque()
         self.running: deque[Sequence] = deque()
+        # MLFQ RR queues (seq objects). Only used when scheduler_policy == "mlfq".
+        self._mlfq_queues: list[deque[Sequence]] = [deque(), deque(), deque()]
+        self._mlfq_epoch = 0
         # INSTRUMENTATION-ONLY
         self.metrics = SchedulerMetrics(num_kv_blocks=max(config.num_kvcache_blocks, 1))
         self.metrics.scheduler_policy = self.scheduler_policy
         self.metrics.scheduler_aging_threshold = self.scheduler_aging_threshold
+        self.metrics.mlfq_q0_quantum = self.mlfq_q0_quantum
+        self.metrics.mlfq_q1_quantum = self.mlfq_q1_quantum
+        self.metrics.mlfq_boost_interval = self.mlfq_boost_interval
 
     def is_finished(self):
         return not self.waiting and not self.running
 
     def add(self, seq: Sequence):
         seq.waiting_age_steps = 0
+        if self.scheduler_policy == "mlfq":
+            seq.mlfq_level = 0
+            seq.mlfq_service_in_level = 0
+            seq.mlfq_wait_steps = 0
+            self._mlfq_queues[0].append(seq)
+            self.metrics.mlfq_q0_admissions += 1
         self.waiting.append(seq)
 
     def _bump_waiting_ages(self) -> None:
@@ -116,7 +132,8 @@ class Scheduler:
                 f"len={seq.num_tokens} computed={seq.num_computed_tokens} "
                 f"cached={seq.num_cached_tokens} block_table_len={len(seq.block_table)} "
                 f"remaining_compute={seq.remaining_compute_tokens} "
-                f"required_blocks={required_blocks} max_tokens={seq.max_tokens}"
+                f"required_blocks={required_blocks} max_tokens={seq.max_tokens} "
+                f"mlfq_level={seq.mlfq_level}"
             )
         return "\n".join(lines)
 
@@ -146,6 +163,10 @@ class Scheduler:
             f"hol_skipped_requests={self.metrics.hol_skipped_requests}"
         )
         return base + "\n" + self._waiting_state_dump()
+
+    # ------------------------------------------------------------------
+    # Parity / SJF / SJF-aging path (unchanged behavior)
+    # ------------------------------------------------------------------
 
     def _admit_from_waiting(
         self,
@@ -179,12 +200,8 @@ class Scheduler:
                     continue
                 self.block_manager.allocate(seq, num_cached_blocks)
 
-            # Recompute/prefill work is over ALL currently known tokens (prompt +
-            # generated), matching origin/real: num_tokens - num_cached_tokens.
             need = seq.remaining_compute_tokens
             if need <= 0:
-                # Prefix cache already covers every known token: decode-ready.
-                # Do not break the waiting queue (that caused empty-batch stalls).
                 self._on_leave_waiting(seq, aging_promoted=choice.aging_promoted)
                 seq.status = SequenceStatus.RUNNING
                 seq.is_prefill = False
@@ -222,7 +239,6 @@ class Scheduler:
             if seq.is_prefill_chunk:
                 take = min(seq.remaining_compute_tokens, token_budget)
                 if take <= 0:
-                    # Decode-ready while still flagged prefill: normalize and retry decode path.
                     seq.is_prefill = False
                     pending_running.appendleft(seq)
                     continue
@@ -261,12 +277,11 @@ class Scheduler:
         self.running.extend(pending_running)
         return scheduled_seqs, token_budget, preempted_this_step, num_preempted
 
-    def schedule(self) -> SchedulerOutput:
+    def _schedule_baseline(self) -> SchedulerOutput:
         scheduled_seqs: list[Sequence] = []
         token_budget = self.max_num_batched_tokens
         num_skipped_waiting = 0
 
-        # INSTRUMENTATION-ONLY
         self.metrics.begin_iteration()
         self.metrics.observe_queues(
             len(self.waiting),
@@ -278,19 +293,14 @@ class Scheduler:
             scheduled_seqs, token_budget
         )
 
-        # Age every current WAITING resident once per schedule() (including those
-        # preempted earlier in this call). HOL skips do not reset age.
         self._bump_waiting_ages()
 
-        # Anti-thrash unless the batch is still empty (liveness for recompute).
         admit_waiting = (not preempted_this_step) or (not scheduled_seqs)
         if admit_waiting:
             scheduled_seqs, token_budget, num_skipped_waiting = self._admit_from_waiting(
                 scheduled_seqs, token_budget
             )
 
-        # Waiting may have promoted decode-ready sequences into running without
-        # scheduling tokens. Give RUNNING a second chance in that case.
         if not scheduled_seqs and self.running and token_budget > 0:
             scheduled_seqs, token_budget, preempted2, num_preempted2 = self._schedule_running(
                 scheduled_seqs, token_budget
@@ -313,10 +323,246 @@ class Scheduler:
             )
 
         assert sum(s.num_scheduled_tokens for s in scheduled_seqs) <= self.max_num_batched_tokens
-
         output = SchedulerOutput(scheduled_seqs)
         self._record_iteration_metrics(output)
         return output
+
+    # ------------------------------------------------------------------
+    # MLFQ path: priority levels + service-token demotion + boost
+    # ------------------------------------------------------------------
+
+    def _mlfq_maybe_boost(self) -> None:
+        interval = self.mlfq_boost_interval
+        if interval <= 0:
+            return
+        # After every `interval` schedule() calls (epoch already incremented).
+        if self._mlfq_epoch % interval != 0:
+            return
+        active = list(self.waiting) + list(self.running)
+        boosted = mlfq_lib.boost_all(self._mlfq_queues, active)
+        self.metrics.mlfq_priority_boosts += 1
+        self.metrics.mlfq_requests_boosted += boosted
+
+    def _mlfq_charge(self, seq: Sequence, tokens: int) -> None:
+        level_before = seq.mlfq_level
+        self.metrics.record_mlfq_service(level_before, tokens)
+        demoted = mlfq_lib.charge_service(
+            seq,
+            tokens,
+            self._mlfq_queues,
+            self.mlfq_q0_quantum,
+            self.mlfq_q1_quantum,
+        )
+        if demoted:
+            self.metrics.record_mlfq_demotion(seq.mlfq_level)
+
+    def _mlfq_ensure_resident(self, seq: Sequence) -> bool:
+        """Allocate KV and move WAITING -> RUNNING if needed. False if cannot."""
+        if seq.status == SequenceStatus.RUNNING and seq.block_table:
+            return True
+        if seq in self.running and seq.block_table:
+            return True
+        if len(self.running) >= self.max_num_seqs and seq not in self.running:
+            return False
+        self.metrics.examine_waiting_candidate()
+        if not seq.block_table:
+            num_cached_blocks = self.block_manager.can_allocate(seq)
+            if num_cached_blocks == -1:
+                self.metrics.record_allocation_failure(hol_skipped=True)
+                return False
+            self.block_manager.allocate(seq, num_cached_blocks)
+        if seq in self.waiting:
+            self.waiting.remove(seq)
+        seq.status = SequenceStatus.RUNNING
+        if seq not in self.running:
+            self.running.append(seq)
+        return True
+
+    def _mlfq_preempt_for_append(self, seq: Sequence) -> tuple[bool, int]:
+        """Free KV for decode append. Returns (ok, num_preempted)."""
+        num_preempted = 0
+        while not self.block_manager.can_append(seq):
+            victim = None
+            for cand in reversed(self.running):
+                if cand is not seq and not cand.is_finished:
+                    victim = cand
+                    break
+            if victim is None:
+                self.preempt(seq)
+                num_preempted += 1
+                return False, num_preempted
+            self.preempt(victim)
+            num_preempted += 1
+        return True, num_preempted
+
+    def _mlfq_try_serve(
+        self,
+        seq: Sequence,
+        token_budget: int,
+        scheduled_seqs: list[Sequence],
+    ) -> tuple[int, int, bool]:
+        """Attempt to schedule ``seq``. Returns (tokens_used, preempted, scheduled)."""
+        if seq.is_finished:
+            mlfq_lib.detach_from_queues(self._mlfq_queues, seq)
+            return 0, 0, False
+
+        if not self._mlfq_ensure_resident(seq):
+            # Cannot allocate/admit: keep at end of its current level for later.
+            mlfq_lib.place_on_level(self._mlfq_queues, seq)
+            return 0, 0, False
+
+        rem_q = mlfq_lib.remaining_quantum(seq, self.mlfq_q0_quantum, self.mlfq_q1_quantum)
+        if rem_q <= 0:
+            demoted = mlfq_lib.demote(
+                seq, self._mlfq_queues, self.mlfq_q0_quantum, self.mlfq_q1_quantum
+            )
+            if demoted:
+                self.metrics.record_mlfq_demotion(seq.mlfq_level)
+            else:
+                mlfq_lib.place_on_level(self._mlfq_queues, seq)
+            return 0, 0, False
+
+        # Prefill / recompute chunk limited by MLFQ remaining quantum.
+        if seq.is_prefill and seq.num_computed_tokens < seq.num_tokens:
+            need = seq.remaining_compute_tokens
+            take = min(need, token_budget, rem_q)
+            if take <= 0:
+                seq.is_prefill = False
+            else:
+                seq.num_scheduled_tokens = take
+                seq.is_prefill = True
+                scheduled_seqs.append(seq)
+                self._instrument_on_schedule(seq)
+                self._mlfq_charge(seq, take)
+                if not seq.is_finished:
+                    mlfq_lib.place_on_level(self._mlfq_queues, seq)
+                return take, 0, True
+
+        # Decode (1 token, also limited by remaining quantum).
+        ok, num_preempted = self._mlfq_preempt_for_append(seq)
+        if not ok:
+            # seq was self-preempted; still on MLFQ queue via preempt()->waiting
+            mlfq_lib.place_on_level(self._mlfq_queues, seq)
+            return 0, num_preempted, False
+        if token_budget < 1:
+            mlfq_lib.place_on_level(self._mlfq_queues, seq)
+            return 0, num_preempted, False
+
+        take = min(1, rem_q, token_budget)
+        seq.num_scheduled_tokens = take
+        seq.is_prefill = False
+        self.block_manager.may_append(seq)
+        scheduled_seqs.append(seq)
+        self._instrument_on_schedule(seq)
+        self._mlfq_charge(seq, take)
+        if not seq.is_finished:
+            mlfq_lib.place_on_level(self._mlfq_queues, seq)
+        return take, num_preempted, True
+
+    def _schedule_mlfq(self) -> SchedulerOutput:
+        scheduled_seqs: list[Sequence] = []
+        token_budget = self.max_num_batched_tokens
+        preempted_this_step = False
+        num_preempted = 0
+
+        self.metrics.begin_iteration()
+        self.metrics.observe_queues(
+            len(self.waiting),
+            len(self.running),
+            len(self.block_manager.used_block_ids),
+        )
+        self.metrics.observe_mlfq_queue_sizes(
+            len(self._mlfq_queues[0]),
+            len(self._mlfq_queues[1]),
+            len(self._mlfq_queues[2]),
+        )
+
+        self._mlfq_epoch += 1
+        self._mlfq_maybe_boost()
+
+        served_ids: set[int] = set()
+
+        for level in (0, 1, 2):
+            if token_budget <= 0 or len(scheduled_seqs) >= self.max_num_seqs:
+                break
+            q = self._mlfq_queues[level]
+            # Keep serving this level while eligible work remains and budget allows.
+            # Bound iterations to avoid infinite loops on persistent alloc failure.
+            safety = max(1, len(q)) * 3 + 8
+            while (
+                q
+                and token_budget > 0
+                and len(scheduled_seqs) < self.max_num_seqs
+                and safety > 0
+            ):
+                safety -= 1
+                # One RR pass: pop each current member once.
+                n = len(q)
+                progressed = False
+                for _ in range(n):
+                    if token_budget <= 0 or len(scheduled_seqs) >= self.max_num_seqs:
+                        break
+                    if not q:
+                        break
+                    seq = q.popleft()
+                    if seq.is_finished:
+                        continue
+                    if seq.seq_id in served_ids:
+                        # At most one service slice per request per schedule().
+                        mlfq_lib.place_on_level(self._mlfq_queues, seq)
+                        continue
+                    if seq.mlfq_level != level:
+                        mlfq_lib.place_on_level(self._mlfq_queues, seq)
+                        continue
+                    level_before = seq.mlfq_level
+                    tokens, preempted, scheduled = self._mlfq_try_serve(
+                        seq, token_budget, scheduled_seqs
+                    )
+                    if preempted:
+                        preempted_this_step = True
+                        num_preempted += preempted
+                    if scheduled or tokens > 0:
+                        token_budget -= tokens
+                        served_ids.add(seq.seq_id)
+                        progressed = True
+                    elif seq.mlfq_level != level_before:
+                        # Demoted without a token slice; do not re-serve this iteration.
+                        served_ids.add(seq.seq_id)
+                        progressed = True
+                    # If not scheduled due to alloc failure, seq was re-queued at level.
+                if not progressed:
+                    break
+
+        # Wait-step accounting for residents that received no service.
+        for seq in list(self.waiting) + list(self.running):
+            if seq.is_finished:
+                continue
+            if seq.seq_id not in served_ids:
+                seq.mlfq_wait_steps += 1
+
+        if not scheduled_seqs:
+            msg = self._format_schedule_debug(
+                token_budget=token_budget,
+                scheduled_seqs=scheduled_seqs,
+                preempted_this_step=preempted_this_step,
+                num_preempted=num_preempted,
+                num_skipped_waiting=0,
+            )
+            if self._debug_enabled():
+                print(msg)
+            raise RuntimeError(
+                "scheduler produced an empty batch with no schedulable tokens; " + msg
+            )
+
+        assert sum(s.num_scheduled_tokens for s in scheduled_seqs) <= self.max_num_batched_tokens
+        output = SchedulerOutput(scheduled_seqs)
+        self._record_iteration_metrics(output)
+        return output
+
+    def schedule(self) -> SchedulerOutput:
+        if self.scheduler_policy == "mlfq":
+            return self._schedule_mlfq()
+        return self._schedule_baseline()
 
     def preempt(self, seq: Sequence):
         # INSTRUMENTATION-ONLY
@@ -328,17 +574,19 @@ class Scheduler:
         seq.num_recomputed_tokens += recomputed
 
         # Destructive recompute: discard KV and invalidate compute progress.
-        # deallocate() zeros num_cached_tokens (= num_computed_tokens) and clears
-        # the block table. Prefix-cache hits are rediscovered on next allocate().
-        # Age restarts: waiting_age_steps measures the *current* continuous WAITING
-        # spell only (not lifetime cumulative wait).
+        # MLFQ: retain mlfq_level and mlfq_service_in_level (engine pressure must
+        # not make a long job look like a fresh short job).
         seq.status = SequenceStatus.WAITING
         seq.is_prefill = True
         seq.waiting_age_steps = 0
         self.block_manager.deallocate(seq)
         assert seq.num_computed_tokens == 0
         assert not seq.block_table
+        if seq in self.running:
+            self.running.remove(seq)
         self.waiting.appendleft(seq)
+        if self.scheduler_policy == "mlfq":
+            mlfq_lib.place_on_level(self._mlfq_queues, seq)
 
     def postprocess(self, seqs: list[Sequence], token_ids: list[int]):
         now = perf_counter()  # INSTRUMENTATION-ONLY timestamp
@@ -359,5 +607,9 @@ class Scheduler:
                 seq.status = SequenceStatus.FINISHED
                 # INSTRUMENTATION-ONLY
                 seq.finish_time = now
+                if self.scheduler_policy == "mlfq":
+                    self.metrics.record_completion_level(seq.mlfq_level)
+                    mlfq_lib.detach_from_queues(self._mlfq_queues, seq)
                 self.block_manager.deallocate(seq)
-                self.running.remove(seq)
+                if seq in self.running:
+                    self.running.remove(seq)
