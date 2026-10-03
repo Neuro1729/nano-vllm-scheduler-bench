@@ -190,6 +190,7 @@ def run_once(
         "temperature": temperature,
         "ignore_eos": True,
         "prefix_cache_policy": "cleared_between_runs; distinct synthetic prompts",
+        "scheduler_policy": getattr(llm.config, "scheduler_policy", "fcfs"),
     }
     config = {
         "max_model_len": llm.config.max_model_len,
@@ -200,6 +201,7 @@ def run_once(
         "enforce_eager": llm.config.enforce_eager,
         "kvcache_block_size": llm.config.kvcache_block_size,
         "num_kvcache_blocks": llm.config.num_kvcache_blocks,
+        "scheduler_policy": getattr(llm.config, "scheduler_policy", "fcfs"),
         "scaled_workload_ranges": describe_scaled_ranges(llm.config.max_model_len),
     }
     return build_result(
@@ -227,6 +229,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--temperature", type=float, default=NEAR_GREEDY_TEMPERATURE)
     p.add_argument("--warmup-tokens", type=int, default=32)
     p.add_argument("--experiment-label", type=str, default="", help="Optional label for crossover experiments")
+    p.add_argument(
+        "--scheduler-policy",
+        type=str,
+        default="fcfs",
+        choices=["fcfs", "sjf"],
+        help="WAITING admission policy (dev experiments; default fcfs matches parity). sjf enabled in follow-up.",
+    )
     return p.parse_args(argv)
 
 
@@ -244,6 +253,7 @@ def main(argv: list[str] | None = None) -> int:
 
     llm_kwargs = {
         "enforce_eager": args.enforce_eager,
+        "scheduler_policy": args.scheduler_policy,
     }
     if args.max_model_len is not None:
         llm_kwargs["max_model_len"] = args.max_model_len

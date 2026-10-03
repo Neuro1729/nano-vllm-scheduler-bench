@@ -88,7 +88,9 @@ python benchmarks/compare_results.py results/real_mixed_run0_seed42.json results
 |--------|---------|
 | `real` | Original Nano-vLLM baseline + instrumentation |
 | `parity` | Modern vLLM-style scheduling semantics (running-first, shared token budget, mixed batches) |
-| `dev` | Reserved for novel policies on top of parity |
+| `dev` | parity + experimental waiting-admission policies (`--scheduler-policy`) |
+
+On `dev`, default `--scheduler-policy fcfs` matches parity. Use `sjf` for non-preemptive shortest-remaining-prefill admission. See `experimental_policies.md`.
 
 On `parity`, expect `scheduler.mixed_iterations > 0` under `mixed` / concurrent decode+prefill workloads. On `real`, `mixed_iterations` stays 0.
 

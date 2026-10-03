@@ -9,24 +9,33 @@ from nanovllm.engine.sequence import Sequence, SequenceStatus
 from nanovllm.engine.block_manager import BlockManager
 from nanovllm.engine.scheduler_metrics import SchedulerMetrics
 from nanovllm.engine.scheduler_output import SchedulerOutput
+from nanovllm.engine.scheduler_policy import (
+    normalize_scheduler_policy,
+    pop_waiting_at,
+    select_waiting_index,
+)
 
 if TYPE_CHECKING:
     from nanovllm.config import Config
 
 
 class Scheduler:
-    """vLLM-V1-style shared token-budget scheduler (parity baseline)."""
+    """vLLM-V1-style shared token-budget scheduler with pluggable WAITING policy."""
 
     def __init__(self, config: Config):
         self.max_num_seqs = config.max_num_seqs
         self.max_num_batched_tokens = config.max_num_batched_tokens
         self.eos = config.eos
         self.block_size = config.kvcache_block_size
+        self.scheduler_policy = normalize_scheduler_policy(
+            getattr(config, "scheduler_policy", "fcfs")
+        )
         self.block_manager = BlockManager(config.num_kvcache_blocks, config.kvcache_block_size)
         self.waiting: deque[Sequence] = deque()
         self.running: deque[Sequence] = deque()
         # INSTRUMENTATION-ONLY
         self.metrics = SchedulerMetrics(num_kv_blocks=max(config.num_kvcache_blocks, 1))
+        self.metrics.scheduler_policy = self.scheduler_policy
 
     def is_finished(self):
         return not self.waiting and not self.running
@@ -130,7 +139,8 @@ class Scheduler:
         scheduled_seqs: list[Sequence],
         token_budget: int,
     ) -> tuple[list[Sequence], int, int]:
-        """FCFS waiting admission with HOL skip. Returns skipped count."""
+        """WAITING admission with HOL skip; order from ``scheduler_policy``."""
+        policy = getattr(self, "scheduler_policy", "fcfs")
         skipped: deque[Sequence] = deque()
         num_skipped = 0
         while (
@@ -139,13 +149,16 @@ class Scheduler:
             and len(scheduled_seqs) < self.max_num_seqs
             and len(self.running) < self.max_num_seqs
         ):
-            seq = self.waiting[0]
+            idx = select_waiting_index(policy, self.waiting)
+            if idx != 0:
+                self.metrics.waiting_reorders += 1
+            seq = pop_waiting_at(self.waiting, idx)
             self.metrics.examine_waiting_candidate()
             if not seq.block_table:
                 num_cached_blocks = self.block_manager.can_allocate(seq)
                 if num_cached_blocks == -1:
                     self.metrics.record_allocation_failure(hol_skipped=True)
-                    skipped.append(self.waiting.popleft())
+                    skipped.append(seq)
                     num_skipped += 1
                     continue
                 self.block_manager.allocate(seq, num_cached_blocks)
@@ -156,7 +169,6 @@ class Scheduler:
             if need <= 0:
                 # Prefix cache already covers every known token: decode-ready.
                 # Do not break the waiting queue (that caused empty-batch stalls).
-                self.waiting.popleft()
                 seq.status = SequenceStatus.RUNNING
                 seq.is_prefill = False
                 self.running.append(seq)
@@ -166,7 +178,6 @@ class Scheduler:
             seq.num_scheduled_tokens = take
             seq.is_prefill = True
             token_budget -= take
-            self.waiting.popleft()
             seq.status = SequenceStatus.RUNNING
             self.running.append(seq)
             scheduled_seqs.append(seq)

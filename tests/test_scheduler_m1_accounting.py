@@ -28,7 +28,9 @@ def _make_scheduler(max_batched_tokens: int = 8, max_seqs: int = 4, num_blocks: 
 
     sched.waiting = deque()
     sched.running = deque()
+    sched.scheduler_policy = "fcfs"
     sched.metrics = SchedulerMetrics(num_kv_blocks=num_blocks)
+    sched.metrics.scheduler_policy = "fcfs"
     return sched
 
 

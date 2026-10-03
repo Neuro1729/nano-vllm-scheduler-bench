@@ -32,6 +32,10 @@ class SchedulerMetrics:
     hol_skipped_requests: int = 0
     # Waiting admission candidates inspected (heads considered in the admit loop).
     waiting_candidates_examined: int = 0
+    # Times WAITING admission selected a non-head candidate (SJF reorders).
+    waiting_reorders: int = 0
+    # Policy name copied from Config for benchmark JSON (does not affect counting).
+    scheduler_policy: str = "fcfs"
     peak_kv_blocks_used: int = 0
     peak_kv_utilization: float = 0.0
     _kv_util_sum: float = 0.0
@@ -56,6 +60,8 @@ class SchedulerMetrics:
         self.allocation_failed_candidates = 0
         self.hol_skipped_requests = 0
         self.waiting_candidates_examined = 0
+        self.waiting_reorders = 0
+        # Keep scheduler_policy across reset (config-level attribute).
         self.peak_kv_blocks_used = 0
         self.peak_kv_utilization = 0.0
         self._kv_util_sum = 0.0
@@ -124,6 +130,8 @@ class SchedulerMetrics:
             "allocation_failed_candidates": self.allocation_failed_candidates,
             "hol_skipped_requests": self.hol_skipped_requests,
             "waiting_candidates_examined": self.waiting_candidates_examined,
+            "waiting_reorders": self.waiting_reorders,
+            "scheduler_policy": self.scheduler_policy,
             "allocation_candidate_failure_rate": self.allocation_candidate_failure_rate,
             "peak_KV_blocks_used": self.peak_kv_blocks_used,
             "average_KV_utilization": self.average_kv_utilization,
