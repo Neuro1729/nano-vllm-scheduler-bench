@@ -118,3 +118,11 @@ class BlockManager:
             h = self.compute_hash(token_ids, h)
             block.update(h, token_ids)
             self.hash_to_block_id[h] = block.block_id
+
+    def clear_prefix_cache(self):
+        """INSTRUMENTATION/BENCH helper: drop prefix-cache index on free blocks."""
+        self.hash_to_block_id.clear()
+        for block_id in self.free_block_ids:
+            block = self.blocks[block_id]
+            block.hash = -1
+            block.token_ids = []

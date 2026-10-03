@@ -32,6 +32,7 @@ class LLMEngine:
         self.tokenizer = AutoTokenizer.from_pretrained(config.model, use_fast=True)
         config.eos = self.tokenizer.eos_token_id
         self.scheduler = Scheduler(config)
+        self.config = config  # INSTRUMENTATION/BENCH: expose resolved config
         atexit.register(self.exit)
 
     def exit(self):
@@ -40,10 +41,22 @@ class LLMEngine:
         for p in self.ps:
             p.join()
 
-    def add_request(self, prompt: str | list[int], sampling_params: SamplingParams):
+    def add_request(
+        self,
+        prompt: str | list[int],
+        sampling_params: SamplingParams,
+        workload_class: str = "unknown",
+        arrival_time: float | None = None,
+        client_request_id: int | None = None,
+    ):
         if isinstance(prompt, str):
             prompt = self.tokenizer.encode(prompt)
         seq = Sequence(prompt, sampling_params)
+        # INSTRUMENTATION-ONLY metadata for benchmarks
+        seq.workload_class = workload_class
+        seq.arrival_time = perf_counter() if arrival_time is None else arrival_time
+        if client_request_id is not None:
+            seq.client_request_id = client_request_id
         self.scheduler.add(seq)
 
     def step(self):

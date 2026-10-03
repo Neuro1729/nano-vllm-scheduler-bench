@@ -29,6 +29,18 @@ class Sequence:
         self.temperature = sampling_params.temperature
         self.max_tokens = sampling_params.max_tokens
         self.ignore_eos = sampling_params.ignore_eos
+        # INSTRUMENTATION-ONLY: unused by scheduling decisions
+        self.workload_class = "unknown"
+        self.arrival_time = 0.0
+        self.first_admission_time = 0.0
+        self.first_token_time = 0.0
+        self.finish_time = 0.0
+        self.num_preemptions = 0
+        self.num_scheduler_steps = 0
+        self.num_recomputed_tokens = 0
+        self.requested_output_tokens = sampling_params.max_tokens
+        self.client_request_id = -1
+        self._instrument_admitted = False
 
     def __len__(self):
         return self.num_tokens
