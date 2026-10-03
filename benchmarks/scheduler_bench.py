@@ -77,8 +77,15 @@ def _attach_finish_collector(llm: LLM) -> None:
     llm._bench_finished_requests = []
     original = llm.scheduler.postprocess
 
-    def postprocess(seqs, token_ids, is_prefill):
-        original(seqs, token_ids, is_prefill)
+    def postprocess(seqs, token_ids, is_prefill=None):
+        # Compat: parity dropped the is_prefill arg; ignore if provided.
+        if is_prefill is None:
+            original(seqs, token_ids)
+        else:
+            try:
+                original(seqs, token_ids, is_prefill)
+            except TypeError:
+                original(seqs, token_ids)
         for seq in seqs:
             if not seq.is_finished:
                 continue

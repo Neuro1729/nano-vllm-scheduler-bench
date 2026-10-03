@@ -127,6 +127,12 @@ class ModelRunner:
         return block_tables
 
     def prepare_prefill(self, seqs: list[Sequence]):
+        """Varlen preparation for prefill-only, decode-as-varlen, or mixed batches.
+
+        Decode requests are represented as q_len=1 queries. When any sequence has
+        prior KV (prefix / decode), block tables are attached so attention reads
+        from the paged cache.
+        """
         input_ids = []
         positions = []
         cu_seqlens_q = [0]
@@ -140,7 +146,11 @@ class ModelRunner:
             seqlen_q = seq.num_scheduled_tokens
             end = start + seqlen_q
             seqlen_k = end
-            input_ids.extend(seq[start:end])
+            if seq.is_prefill:
+                input_ids.extend(seq[start:end])
+            else:
+                # Decode: schedule the last token already present in the sequence.
+                input_ids.append(seq.last_token)
             positions.extend(range(start, end))
             cu_seqlens_q.append(cu_seqlens_q[-1] + seqlen_q)
             cu_seqlens_k.append(cu_seqlens_k[-1] + seqlen_k)
@@ -159,7 +169,8 @@ class ModelRunner:
                 else:
                     slot_end = seq.block_table[i] * self.block_size + end - i * self.block_size
                 slot_mapping.extend(range(slot_start, slot_end))
-        if cu_seqlens_k[-1] > cu_seqlens_q[-1]:    # prefix cache
+        # Use paged KV whenever prior context exists (prefix cache and/or decode).
+        if cu_seqlens_k[-1] > cu_seqlens_q[-1]:
             block_tables = self.prepare_block_tables(seqs)
         input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
         positions = torch.tensor(positions, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
@@ -193,8 +204,8 @@ class ModelRunner:
         return temperatures
 
     @torch.inference_mode()
-    def run_model(self, input_ids: torch.Tensor, positions: torch.Tensor, is_prefill: bool):
-        if is_prefill or self.enforce_eager or input_ids.size(0) > 512:
+    def run_model(self, input_ids: torch.Tensor, positions: torch.Tensor, use_cudagraph: bool):
+        if not use_cudagraph or self.enforce_eager or input_ids.size(0) > 512:
             return self.model.compute_logits(self.model(input_ids, positions))
         else:
             bs = input_ids.size(0)
@@ -211,10 +222,25 @@ class ModelRunner:
             graph.replay()
             return self.model.compute_logits(graph_vars["outputs"][:bs])
 
-    def run(self, seqs: list[Sequence], is_prefill: bool) -> list[int]:
-        input_ids, positions = self.prepare_prefill(seqs) if is_prefill else self.prepare_decode(seqs)
+    def run(self, seqs: list[Sequence], is_prefill: bool | None = None) -> list[int]:
+        """Run a batch. `is_prefill` kept for compat; inferred from seq flags if None."""
+        if is_prefill is None:
+            has_prefill = any(seq.is_prefill for seq in seqs)
+            has_decode = any(not seq.is_prefill for seq in seqs)
+        else:
+            has_prefill = bool(is_prefill)
+            has_decode = not bool(is_prefill)
+
+        # Mixed or prefill: eager varlen path (decode rows use q_len=1).
+        # Pure decode: keep CUDA-graph optimized path when available.
+        if has_prefill:
+            input_ids, positions = self.prepare_prefill(seqs)
+            use_cudagraph = False
+        else:
+            input_ids, positions = self.prepare_decode(seqs)
+            use_cudagraph = True
         temperatures = self.prepare_sample(seqs) if self.rank == 0 else None
-        logits = self.run_model(input_ids, positions, is_prefill)
+        logits = self.run_model(input_ids, positions, use_cudagraph)
         token_ids = self.sampler(logits, temperatures).tolist() if self.rank == 0 else None
         reset_context()
         return token_ids

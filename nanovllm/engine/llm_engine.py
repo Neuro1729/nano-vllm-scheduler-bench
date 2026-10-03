@@ -67,8 +67,7 @@ class LLMEngine:
             num_tokens = -len(seqs)
         else:
             num_tokens = sched_out.num_prefill_tokens
-        # ModelRunner still accepts exclusive is_prefill until mixed-batch milestone.
-        token_ids = self.model_runner.call("run", seqs, sched_out.is_prefill_only or sched_out.is_mixed)
+        token_ids = self.model_runner.call("run", seqs)
         self.scheduler.postprocess(seqs, token_ids)
         outputs = [(seq.seq_id, seq.completion_token_ids) for seq in seqs if seq.is_finished]
         return outputs, num_tokens
