@@ -60,10 +60,16 @@ class LLMEngine:
         self.scheduler.add(seq)
 
     def step(self):
-        seqs, is_prefill = self.scheduler.schedule()
-        num_tokens = sum(seq.num_scheduled_tokens for seq in seqs) if is_prefill else -len(seqs)
-        token_ids = self.model_runner.call("run", seqs, is_prefill)
-        self.scheduler.postprocess(seqs, token_ids, is_prefill)
+        sched_out = self.scheduler.schedule()
+        seqs = sched_out.seqs
+        # Throughput hint: positive => prefill tokens; negative => decode seq count.
+        if sched_out.is_decode_only:
+            num_tokens = -len(seqs)
+        else:
+            num_tokens = sched_out.num_prefill_tokens
+        # ModelRunner still accepts exclusive is_prefill until mixed-batch milestone.
+        token_ids = self.model_runner.call("run", seqs, sched_out.is_prefill_only or sched_out.is_mixed)
+        self.scheduler.postprocess(seqs, token_ids)
         outputs = [(seq.seq_id, seq.completion_token_ids) for seq in seqs if seq.is_finished]
         return outputs, num_tokens
 

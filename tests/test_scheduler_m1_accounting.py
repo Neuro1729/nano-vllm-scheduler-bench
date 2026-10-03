@@ -38,10 +38,10 @@ def test_partial_prefill_moves_to_running():
     seq = Sequence(prompt, SamplingParams(temperature=1e-5, max_tokens=2, ignore_eos=True))
     sched.add(seq)
 
-    seqs, is_prefill = sched.schedule()
-    assert is_prefill is True
-    assert len(seqs) == 1
-    assert seqs[0] is seq
+    out = sched.schedule()
+    assert out.is_prefill_only is True
+    assert out.num_seqs == 1
+    assert out.seqs[0] is seq
     assert seq.status == SequenceStatus.RUNNING
     assert seq.is_prefill_chunk is True  # prompt not fully computed yet
     assert seq.num_scheduled_tokens == 4
@@ -53,8 +53,8 @@ def test_partial_prefill_moves_to_running():
     seq.num_scheduled_tokens = 0
     assert seq.is_prefill_chunk is True
 
-    seqs2, is_prefill2 = sched.schedule()
-    assert is_prefill2 is True
-    assert seqs2[0] is seq
+    out2 = sched.schedule()
+    assert out2.is_prefill_only is True
+    assert out2.seqs[0] is seq
     assert seq.num_scheduled_tokens == 4  # next chunk clipped to budget
     assert seq in sched.running

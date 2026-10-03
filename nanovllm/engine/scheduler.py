@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING
 from nanovllm.engine.sequence import Sequence, SequenceStatus
 from nanovllm.engine.block_manager import BlockManager
 from nanovllm.engine.scheduler_metrics import SchedulerMetrics
+from nanovllm.engine.scheduler_output import SchedulerOutput
 
 if TYPE_CHECKING:
     from nanovllm.config import Config
@@ -39,8 +40,8 @@ class Scheduler:
             seq._instrument_admitted = True
         seq.num_scheduler_steps += 1
 
-    def schedule(self) -> tuple[list[Sequence], bool]:
-        scheduled_seqs = []
+    def schedule(self) -> SchedulerOutput:
+        scheduled_seqs: list[Sequence] = []
         num_batched_tokens = 0
 
         # INSTRUMENTATION-ONLY
@@ -107,7 +108,7 @@ class Scheduler:
             # INSTRUMENTATION-ONLY
             self.metrics.scheduler_iterations += 1
             self.metrics.prefill_iterations += 1
-            return scheduled_seqs, True
+            return SchedulerOutput(scheduled_seqs)
 
         # decode (only sequences that finished prompt prefill)
         while self.running and len(scheduled_seqs) < self.max_num_seqs:
@@ -133,7 +134,7 @@ class Scheduler:
         # INSTRUMENTATION-ONLY
         self.metrics.scheduler_iterations += 1
         self.metrics.decode_iterations += 1
-        return scheduled_seqs, False
+        return SchedulerOutput(scheduled_seqs)
 
     def preempt(self, seq: Sequence):
         # INSTRUMENTATION-ONLY
@@ -149,14 +150,13 @@ class Scheduler:
         self.block_manager.deallocate(seq)
         self.waiting.appendleft(seq)
 
-    def postprocess(self, seqs: list[Sequence], token_ids: list[int], is_prefill: bool):
+    def postprocess(self, seqs: list[Sequence], token_ids: list[int]):
         now = perf_counter()  # INSTRUMENTATION-ONLY timestamp
         for seq, token_id in zip(seqs, token_ids):
             self.block_manager.hash_blocks(seq)
             seq.num_cached_tokens += seq.num_scheduled_tokens
             seq.num_scheduled_tokens = 0
-            # Prefer computed-token accounting; keep is_prefill arg for API compat.
-            if seq.is_prefill_chunk or (is_prefill and seq.num_cached_tokens < seq.num_tokens):
+            if seq.is_prefill_chunk:
                 continue
             seq.is_prefill = False
             seq.append_token(token_id)
