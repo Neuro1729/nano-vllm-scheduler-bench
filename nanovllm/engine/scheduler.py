@@ -14,6 +14,7 @@ if TYPE_CHECKING:
 
 
 class Scheduler:
+    """vLLM-V1-style shared token-budget scheduler (parity baseline)."""
 
     def __init__(self, config: Config):
         self.max_num_seqs = config.max_num_seqs
@@ -40,9 +41,27 @@ class Scheduler:
             seq._instrument_admitted = True
         seq.num_scheduler_steps += 1
 
+    def _record_iteration_metrics(self, output: SchedulerOutput) -> None:
+        self.metrics.scheduler_iterations += 1
+        self.metrics.scheduled_prefill_tokens += output.num_prefill_tokens
+        self.metrics.scheduled_decode_tokens += output.num_decode_tokens
+        self.metrics.chunked_prefill_count += sum(
+            1
+            for seq in output.seqs
+            if seq.is_prefill
+            and seq.num_computed_tokens + seq.num_scheduled_tokens < seq.num_prompt_tokens
+        )
+        if output.is_mixed:
+            self.metrics.mixed_iterations += 1
+        elif output.is_prefill_only:
+            self.metrics.prefill_iterations += 1
+        elif output.is_decode_only:
+            self.metrics.decode_iterations += 1
+
     def schedule(self) -> SchedulerOutput:
         scheduled_seqs: list[Sequence] = []
-        num_batched_tokens = 0
+        token_budget = self.max_num_batched_tokens
+        preempted_this_step = False
 
         # INSTRUMENTATION-ONLY
         self.metrics.observe_queues(
@@ -51,90 +70,100 @@ class Scheduler:
             len(self.block_manager.used_block_ids),
         )
 
-        # Prefill: continue in-progress running chunks, then admit from waiting.
-        # Partial prefills live in `running` (parity accounting); exclusive phase
-        # still returns before decode (mixed batches arrive in a later milestone).
-        running_prefills = deque(seq for seq in self.running if seq.is_prefill_chunk)
-        self.running = deque(seq for seq in self.running if not seq.is_prefill_chunk)
+        # ------------------------------------------------------------------
+        # 1) Schedule RUNNING first (decode + in-progress prefill chunks).
+        # ------------------------------------------------------------------
+        pending_running = self.running
+        self.running = deque()
 
-        while running_prefills and len(scheduled_seqs) < self.max_num_seqs:
-            seq = running_prefills[0]
-            remaining = self.max_num_batched_tokens - num_batched_tokens
-            if remaining == 0:
-                break
-            num_tokens = seq.remaining_prefill_tokens
-            if remaining < num_tokens and scheduled_seqs:  # only allow chunked prefill for the first seq
-                break
-            running_prefills.popleft()
-            seq.num_scheduled_tokens = min(num_tokens, remaining)
-            seq.is_prefill = True
-            num_batched_tokens += seq.num_scheduled_tokens
-            self.running.append(seq)
-            self._instrument_on_schedule(seq)
-            scheduled_seqs.append(seq)
+        while pending_running and len(scheduled_seqs) < self.max_num_seqs and token_budget > 0:
+            seq = pending_running.popleft()
 
-        while self.waiting and len(scheduled_seqs) < self.max_num_seqs:
-            seq = self.waiting[0]
-            remaining = self.max_num_batched_tokens - num_batched_tokens
-            if remaining == 0:
-                break
-            if not seq.block_table:
-                num_cached_blocks = self.block_manager.can_allocate(seq)
-                if num_cached_blocks == -1:
-                    # INSTRUMENTATION-ONLY
-                    self.metrics.allocation_failures += 1
-                    break
-                num_tokens = seq.num_tokens - num_cached_blocks * self.block_size
-            else:
-                num_tokens = seq.remaining_prefill_tokens
-            if remaining < num_tokens and scheduled_seqs:  # only allow chunked prefill for the first seq
-                break
-            if not seq.block_table:
-                self.block_manager.allocate(seq, num_cached_blocks)
-            seq.num_scheduled_tokens = min(num_tokens, remaining)
-            seq.is_prefill = True
-            num_batched_tokens += seq.num_scheduled_tokens
-            self.waiting.popleft()
-            # Admitted prefills (full or partial) become running immediately.
-            seq.status = SequenceStatus.RUNNING
-            self.running.append(seq)
-            self._instrument_on_schedule(seq)
-            scheduled_seqs.append(seq)
-
-        # Keep unscheduled in-progress prefills in running.
-        self.running.extend(running_prefills)
-
-        if scheduled_seqs:
-            # INSTRUMENTATION-ONLY
-            self.metrics.scheduler_iterations += 1
-            self.metrics.prefill_iterations += 1
-            return SchedulerOutput(scheduled_seqs)
-
-        # decode (only sequences that finished prompt prefill)
-        while self.running and len(scheduled_seqs) < self.max_num_seqs:
-            seq = self.running.popleft()
             if seq.is_prefill_chunk:
-                # Should not happen after the prefill pass drained chunks; keep safe.
+                take = min(seq.remaining_prefill_tokens, token_budget)
+                if take <= 0:
+                    self.running.append(seq)
+                    continue
+                seq.num_scheduled_tokens = take
+                seq.is_prefill = True
+                token_budget -= take
+                scheduled_seqs.append(seq)
                 self.running.append(seq)
-                break
+                self._instrument_on_schedule(seq)
+                continue
+
+            # Decode: need one token of budget and possibly a new KV block.
             while not self.block_manager.can_append(seq):
-                if self.running:
-                    self.preempt(self.running.pop())
+                if pending_running:
+                    self.preempt(pending_running.pop())
+                    preempted_this_step = True
                 else:
                     self.preempt(seq)
+                    preempted_this_step = True
+                    seq = None
                     break
-            else:
-                seq.num_scheduled_tokens = 1
-                seq.is_prefill = False
-                self.block_manager.may_append(seq)
-                self._instrument_on_schedule(seq)
+            if seq is None:
+                continue
+            if token_budget < 1:
+                self.running.append(seq)
+                break
+            seq.num_scheduled_tokens = 1
+            seq.is_prefill = False
+            self.block_manager.may_append(seq)
+            token_budget -= 1
+            scheduled_seqs.append(seq)
+            self.running.append(seq)
+            self._instrument_on_schedule(seq)
+
+        # Preserve unscheduled running requests (FCFS tail).
+        self.running.extend(pending_running)
+
+        # ------------------------------------------------------------------
+        # 2) Fill remaining budget from WAITING (HOL skip on alloc failure).
+        #    Skip waiting admission if we preempted this step (avoid thrash).
+        # ------------------------------------------------------------------
+        if not preempted_this_step:
+            skipped: deque[Sequence] = deque()
+            while (
+                self.waiting
+                and token_budget > 0
+                and len(scheduled_seqs) < self.max_num_seqs
+                and len(self.running) < self.max_num_seqs
+            ):
+                seq = self.waiting[0]
+                if not seq.block_table:
+                    num_cached_blocks = self.block_manager.can_allocate(seq)
+                    if num_cached_blocks == -1:
+                        # HOL skip: try later waiting requests.
+                        self.metrics.allocation_failures += 1
+                        skipped.append(self.waiting.popleft())
+                        continue
+                    self.block_manager.allocate(seq, num_cached_blocks)
+
+                need = seq.remaining_prefill_tokens
+                take = min(need, token_budget)
+                if take <= 0:
+                    break
+
+                seq.num_scheduled_tokens = take
+                seq.is_prefill = True
+                token_budget -= take
+                self.waiting.popleft()
+                seq.status = SequenceStatus.RUNNING
+                self.running.append(seq)
                 scheduled_seqs.append(seq)
-        assert scheduled_seqs
-        self.running.extendleft(reversed(scheduled_seqs))
-        # INSTRUMENTATION-ONLY
-        self.metrics.scheduler_iterations += 1
-        self.metrics.decode_iterations += 1
-        return SchedulerOutput(scheduled_seqs)
+                self._instrument_on_schedule(seq)
+
+            # Re-queue skipped requests at the front, preserving their relative order.
+            for seq in reversed(skipped):
+                self.waiting.appendleft(seq)
+
+        assert scheduled_seqs, "scheduler produced an empty batch"
+        assert sum(s.num_scheduled_tokens for s in scheduled_seqs) <= self.max_num_batched_tokens
+
+        output = SchedulerOutput(scheduled_seqs)
+        self._record_iteration_metrics(output)
+        return output
 
     def preempt(self, seq: Sequence):
         # INSTRUMENTATION-ONLY

@@ -12,6 +12,9 @@ class SchedulerMetrics:
     prefill_iterations: int = 0
     decode_iterations: int = 0
     mixed_iterations: int = 0
+    scheduled_prefill_tokens: int = 0
+    scheduled_decode_tokens: int = 0
+    chunked_prefill_count: int = 0
     preemption_count: int = 0
     preempted_request_ids: set[int] = field(default_factory=set)
     recomputed_tokens: int = 0
@@ -28,6 +31,9 @@ class SchedulerMetrics:
         self.prefill_iterations = 0
         self.decode_iterations = 0
         self.mixed_iterations = 0
+        self.scheduled_prefill_tokens = 0
+        self.scheduled_decode_tokens = 0
+        self.chunked_prefill_count = 0
         self.preemption_count = 0
         self.preempted_request_ids.clear()
         self.recomputed_tokens = 0
@@ -60,6 +66,9 @@ class SchedulerMetrics:
             "prefill_iterations": self.prefill_iterations,
             "decode_iterations": self.decode_iterations,
             "mixed_iterations": self.mixed_iterations,
+            "scheduled_prefill_tokens": self.scheduled_prefill_tokens,
+            "scheduled_decode_tokens": self.scheduled_decode_tokens,
+            "chunked_prefill_count": self.chunked_prefill_count,
             "preemption_count": self.preemption_count,
             "preempted_requests": len(self.preempted_request_ids),
             "recomputed_tokens": self.recomputed_tokens,
