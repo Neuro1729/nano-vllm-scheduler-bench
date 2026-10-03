@@ -63,12 +63,25 @@ class Sequence:
 
     @property
     def is_prefill_chunk(self) -> bool:
-        """True while prompt KV is incomplete (admitted partial / in-progress prefill)."""
-        return self.num_computed_tokens < self.num_prompt_tokens
+        """True while prefill/recompute KV is incomplete for currently known tokens.
+
+        Matches original Nano-vLLM recompute semantics: after preemption, all
+        tokens present in `token_ids` (prompt + generated) must regain KV before
+        decode resumes. `num_computed_tokens` counts only tokens with valid KV.
+        """
+        return self.is_prefill and self.num_computed_tokens < self.num_tokens
 
     @property
     def remaining_prefill_tokens(self) -> int:
-        return max(0, self.num_prompt_tokens - self.num_computed_tokens)
+        """Tokens that still need KV written during prefill/recompute."""
+        if not self.is_prefill:
+            return 0
+        return max(0, self.num_tokens - self.num_computed_tokens)
+
+    @property
+    def remaining_compute_tokens(self) -> int:
+        """Alias used by the scheduler for prefill/recompute admission."""
+        return self.remaining_prefill_tokens
 
     @property
     def num_completion_tokens(self):

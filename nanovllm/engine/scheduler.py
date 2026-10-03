@@ -50,7 +50,7 @@ class Scheduler:
             1
             for seq in output.seqs
             if seq.is_prefill
-            and seq.num_computed_tokens + seq.num_scheduled_tokens < seq.num_prompt_tokens
+            and seq.num_computed_tokens + seq.num_scheduled_tokens < seq.num_tokens
         )
         if output.is_mixed:
             self.metrics.mixed_iterations += 1
@@ -62,6 +62,42 @@ class Scheduler:
     def _debug_enabled(self) -> bool:
         return os.environ.get("NANOVLLM_SCHED_DEBUG", "").strip() not in {"", "0", "false", "False"}
 
+    def _waiting_state_dump(self, limit: int = 10) -> str:
+        lines = ["waiting request diagnostic:"]
+        rem_pos = rem_zero = no_table = computed_no_kv = prefilled_waiting = 0
+        for seq in self.waiting:
+            rem = seq.remaining_compute_tokens
+            if rem > 0:
+                rem_pos += 1
+            else:
+                rem_zero += 1
+            if not seq.block_table:
+                no_table += 1
+            if seq.num_computed_tokens > 0 and not seq.block_table:
+                computed_no_kv += 1
+            if seq.num_computed_tokens >= seq.num_prompt_tokens and seq.status == SequenceStatus.WAITING:
+                prefilled_waiting += 1
+
+        lines.append(
+            "  aggregates: "
+            f"remaining>0={rem_pos} remaining==0={rem_zero} "
+            f"no_block_table={no_table} "
+            f"computed>0_without_kv={computed_no_kv} "
+            f"computed>=prompt_but_waiting={prefilled_waiting}"
+        )
+        for seq in list(self.waiting)[:limit]:
+            required_blocks = seq.num_blocks
+            lines.append(
+                "  "
+                f"seq_id={seq.seq_id} status={seq.status.name} is_prefill={seq.is_prefill} "
+                f"prompt={seq.num_prompt_tokens} output={seq.num_completion_tokens} "
+                f"len={seq.num_tokens} computed={seq.num_computed_tokens} "
+                f"cached={seq.num_cached_tokens} block_table_len={len(seq.block_table)} "
+                f"remaining_compute={seq.remaining_compute_tokens} "
+                f"required_blocks={required_blocks} max_tokens={seq.max_tokens}"
+            )
+        return "\n".join(lines)
+
     def _format_schedule_debug(
         self,
         *,
@@ -71,7 +107,7 @@ class Scheduler:
         num_preempted: int,
         num_skipped_waiting: int,
     ) -> str:
-        return (
+        base = (
             "scheduler empty-batch debug: "
             f"token_budget={token_budget} "
             f"len(running)={len(self.running)} "
@@ -84,6 +120,7 @@ class Scheduler:
             f"num_skipped_waiting={num_skipped_waiting} "
             f"allocation_failures={self.metrics.allocation_failures}"
         )
+        return base + "\n" + self._waiting_state_dump()
 
     def _admit_from_waiting(
         self,
@@ -109,11 +146,19 @@ class Scheduler:
                     continue
                 self.block_manager.allocate(seq, num_cached_blocks)
 
-            need = seq.remaining_prefill_tokens
-            take = min(need, token_budget)
-            if take <= 0:
-                break
+            # Recompute/prefill work is over ALL currently known tokens (prompt +
+            # generated), matching origin/real: num_tokens - num_cached_tokens.
+            need = seq.remaining_compute_tokens
+            if need <= 0:
+                # Prefix cache already covers every known token: decode-ready.
+                # Do not break the waiting queue (that caused empty-batch stalls).
+                self.waiting.popleft()
+                seq.status = SequenceStatus.RUNNING
+                seq.is_prefill = False
+                self.running.append(seq)
+                continue
 
+            take = min(need, token_budget)
             seq.num_scheduled_tokens = take
             seq.is_prefill = True
             token_budget -= take
@@ -127,23 +172,14 @@ class Scheduler:
             self.waiting.appendleft(seq)
         return scheduled_seqs, token_budget, num_skipped
 
-    def schedule(self) -> SchedulerOutput:
-        scheduled_seqs: list[Sequence] = []
-        token_budget = self.max_num_batched_tokens
+    def _schedule_running(
+        self,
+        scheduled_seqs: list[Sequence],
+        token_budget: int,
+    ) -> tuple[list[Sequence], int, bool, int]:
+        """Schedule from RUNNING. Returns preempted flag and preempt count."""
         preempted_this_step = False
         num_preempted = 0
-        num_skipped_waiting = 0
-
-        # INSTRUMENTATION-ONLY
-        self.metrics.observe_queues(
-            len(self.waiting),
-            len(self.running),
-            len(self.block_manager.used_block_ids),
-        )
-
-        # ------------------------------------------------------------------
-        # 1) Schedule RUNNING first (decode + in-progress prefill chunks).
-        # ------------------------------------------------------------------
         pending_running = self.running
         self.running = deque()
 
@@ -151,9 +187,11 @@ class Scheduler:
             seq = pending_running.popleft()
 
             if seq.is_prefill_chunk:
-                take = min(seq.remaining_prefill_tokens, token_budget)
+                take = min(seq.remaining_compute_tokens, token_budget)
                 if take <= 0:
-                    self.running.append(seq)
+                    # Decode-ready while still flagged prefill: normalize and retry decode path.
+                    seq.is_prefill = False
+                    pending_running.appendleft(seq)
                     continue
                 seq.num_scheduled_tokens = take
                 seq.is_prefill = True
@@ -163,16 +201,12 @@ class Scheduler:
                 self._instrument_on_schedule(seq)
                 continue
 
-            # Decode: need one token of budget and possibly a new KV block.
-            # Preemption frees blocks; the while-loop retries can_append.
             while not self.block_manager.can_append(seq):
                 if pending_running:
                     self.preempt(pending_running.pop())
                     preempted_this_step = True
                     num_preempted += 1
                 else:
-                    # Last resort: preempt self. KV is freed and seq returns to
-                    # waiting for recompute; do not count it as scheduled work.
                     self.preempt(seq)
                     preempted_this_step = True
                     num_preempted += 1
@@ -191,27 +225,40 @@ class Scheduler:
             self.running.append(seq)
             self._instrument_on_schedule(seq)
 
-        # Preserve unscheduled running requests (FCFS tail).
         self.running.extend(pending_running)
+        return scheduled_seqs, token_budget, preempted_this_step, num_preempted
 
-        # ------------------------------------------------------------------
-        # 2) Fill remaining budget from WAITING (HOL skip on alloc failure).
-        #
-        # Anti-thrash: after a preemption that already produced model work,
-        # defer new waiting admits to the next iteration (vLLM-like).
-        #
-        # Liveness: if the batch is still empty after preemption, we MUST
-        # admit from waiting in this same step so freed KV can be used for
-        # recompute. Otherwise the engine would hit an empty-batch dead end.
-        # ------------------------------------------------------------------
-        # Anti-thrash: after preemption that already scheduled model work, defer
-        # new waiting admits (vLLM-like). Liveness: if the batch is still empty,
-        # always admit waiting so freed KV can be used for recompute immediately.
+    def schedule(self) -> SchedulerOutput:
+        scheduled_seqs: list[Sequence] = []
+        token_budget = self.max_num_batched_tokens
+        num_skipped_waiting = 0
+
+        # INSTRUMENTATION-ONLY
+        self.metrics.observe_queues(
+            len(self.waiting),
+            len(self.running),
+            len(self.block_manager.used_block_ids),
+        )
+
+        scheduled_seqs, token_budget, preempted_this_step, num_preempted = self._schedule_running(
+            scheduled_seqs, token_budget
+        )
+
+        # Anti-thrash unless the batch is still empty (liveness for recompute).
         admit_waiting = (not preempted_this_step) or (not scheduled_seqs)
         if admit_waiting:
             scheduled_seqs, token_budget, num_skipped_waiting = self._admit_from_waiting(
                 scheduled_seqs, token_budget
             )
+
+        # Waiting may have promoted decode-ready sequences into running without
+        # scheduling tokens. Give RUNNING a second chance in that case.
+        if not scheduled_seqs and self.running and token_budget > 0:
+            scheduled_seqs, token_budget, preempted2, num_preempted2 = self._schedule_running(
+                scheduled_seqs, token_budget
+            )
+            preempted_this_step = preempted_this_step or preempted2
+            num_preempted += num_preempted2
 
         if not scheduled_seqs:
             msg = self._format_schedule_debug(
@@ -223,7 +270,6 @@ class Scheduler:
             )
             if self._debug_enabled():
                 print(msg)
-            # Prefer a loud failure over an engine spin on perpetual empty batches.
             raise RuntimeError(
                 "scheduler produced an empty batch with no schedulable tokens; " + msg
             )
@@ -243,9 +289,14 @@ class Scheduler:
         seq.num_preemptions += 1
         seq.num_recomputed_tokens += recomputed
 
+        # Destructive recompute: discard KV and invalidate compute progress.
+        # deallocate() zeros num_cached_tokens (= num_computed_tokens) and clears
+        # the block table. Prefix-cache hits are rediscovered on next allocate().
         seq.status = SequenceStatus.WAITING
         seq.is_prefill = True
         self.block_manager.deallocate(seq)
+        assert seq.num_computed_tokens == 0
+        assert not seq.block_table
         self.waiting.appendleft(seq)
 
     def postprocess(self, seqs: list[Sequence], token_ids: list[int]):
@@ -254,7 +305,9 @@ class Scheduler:
             self.block_manager.hash_blocks(seq)
             seq.num_cached_tokens += seq.num_scheduled_tokens
             seq.num_scheduled_tokens = 0
-            if seq.is_prefill_chunk:
+            # Real semantics: while recomputing/prefilling existing tokens, do not
+            # append a new sampled token until computed catches up to num_tokens.
+            if seq.is_prefill and seq.num_computed_tokens < seq.num_tokens:
                 continue
             seq.is_prefill = False
             seq.append_token(token_id)
