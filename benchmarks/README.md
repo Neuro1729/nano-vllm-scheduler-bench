@@ -82,14 +82,36 @@ python benchmarks/compare_results.py results/real_mixed_run0_seed42.json results
 - Prefix cache is cleared between runs; prompts are salted to avoid accidental reuse
 - Two GPUs of the same SKU can still differ: always run the crossover
 
+## Branches
+
+| Branch | Meaning |
+|--------|---------|
+| `real` | Original Nano-vLLM baseline + instrumentation |
+| `parity` | Modern vLLM-style scheduling semantics (running-first, shared token budget, mixed batches) |
+| `dev` | Reserved for novel policies on top of parity |
+
+On `parity`, expect `scheduler.mixed_iterations > 0` under `mixed` / concurrent decode+prefill workloads. On `real`, `mixed_iterations` stays 0.
+
 ## Instrumentation
 
 Minimal hooks in:
 
 - `nanovllm/engine/sequence.py` (per-request timestamps/counters)
-- `nanovllm/engine/scheduler.py` (iteration/preempt/KV stats only)
+- `nanovllm/engine/scheduler.py` (iteration/preempt/KV stats; parity also counts mixed/prefill/decode tokens)
 - `nanovllm/engine/scheduler_metrics.py` (counter container)
 - `nanovllm/engine/block_manager.py` (`clear_prefix_cache` helper)
 - `nanovllm/engine/llm_engine.py` (optional request metadata kwargs)
 
-Scheduling control flow is intentionally unchanged.
+Allocation metrics (waiting admit, `can_allocate == -1` only):
+
+| Field | Meaning | Cross-branch |
+|-------|---------|--------------|
+| `allocation_failure_steps` | Iterations with ≥1 waiting alloc failure | Comparable |
+| `allocation_failed_candidates` | Waiting requests that failed alloc | Parity may be higher (HOL skip) |
+| `hol_skipped_requests` | Waiting requests skipped to continue scan | ~0 on real |
+| `waiting_candidates_examined` | Waiting heads inspected | Policy-dependent |
+| `allocation_failures` | Legacy alias of failed-candidate hits | Not comparable raw |
+
+Prefer `allocation_failure_steps`, preemptions, recomputed tokens, and KV util for pressure comparisons.
+
+TTFT / TPOT / E2E definitions are unchanged across branches.

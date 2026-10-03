@@ -39,6 +39,7 @@ class Scheduler:
         num_batched_tokens = 0
 
         # INSTRUMENTATION-ONLY
+        self.metrics.begin_iteration()
         self.metrics.observe_queues(
             len(self.waiting),
             len(self.running),
@@ -51,11 +52,13 @@ class Scheduler:
             remaining = self.max_num_batched_tokens - num_batched_tokens
             if remaining == 0:
                 break
+            # INSTRUMENTATION-ONLY
+            self.metrics.examine_waiting_candidate()
             if not seq.block_table:
                 num_cached_blocks = self.block_manager.can_allocate(seq)
                 if num_cached_blocks == -1:
-                    # INSTRUMENTATION-ONLY
-                    self.metrics.allocation_failures += 1
+                    # INSTRUMENTATION-ONLY (real: HOL stop, not skip)
+                    self.metrics.record_allocation_failure(hol_skipped=False)
                     break
                 num_tokens = seq.num_tokens - num_cached_blocks * self.block_size
             else:
