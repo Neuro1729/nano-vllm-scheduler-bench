@@ -86,6 +86,12 @@ def _global_rows(real: dict, dev: dict) -> list[tuple[str, Any, Any, bool]]:
         ("Preempted requests", "scheduler.preempted_requests", True),
         ("Recomputed tokens", "scheduler.recomputed_tokens", True),
         ("Alloc failures", "scheduler.allocation_failures", True),
+        ("Mixed iterations", "scheduler.mixed_iterations", False),
+        ("Prefill iterations", "scheduler.prefill_iterations", False),
+        ("Decode iterations", "scheduler.decode_iterations", False),
+        ("Sched prefill toks", "scheduler.scheduled_prefill_tokens", False),
+        ("Sched decode toks", "scheduler.scheduled_decode_tokens", False),
+        ("Chunked prefills", "scheduler.chunked_prefill_count", False),
         ("Peak KV util", "scheduler.peak_KV_utilization", True),
         ("Avg KV util", "scheduler.average_KV_utilization", False),
     ]

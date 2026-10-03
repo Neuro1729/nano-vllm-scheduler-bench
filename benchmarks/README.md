@@ -82,14 +82,24 @@ python benchmarks/compare_results.py results/real_mixed_run0_seed42.json results
 - Prefix cache is cleared between runs; prompts are salted to avoid accidental reuse
 - Two GPUs of the same SKU can still differ: always run the crossover
 
+## Branches
+
+| Branch | Meaning |
+|--------|---------|
+| `real` | Original Nano-vLLM baseline + instrumentation |
+| `parity` | Modern vLLM-style scheduling semantics (running-first, shared token budget, mixed batches) |
+| `dev` | Reserved for novel policies on top of parity |
+
+On `parity`, expect `scheduler.mixed_iterations > 0` under `mixed` / concurrent decode+prefill workloads. On `real`, `mixed_iterations` stays 0.
+
 ## Instrumentation
 
 Minimal hooks in:
 
 - `nanovllm/engine/sequence.py` (per-request timestamps/counters)
-- `nanovllm/engine/scheduler.py` (iteration/preempt/KV stats only)
+- `nanovllm/engine/scheduler.py` (iteration/preempt/KV stats; parity also counts mixed/prefill/decode tokens)
 - `nanovllm/engine/scheduler_metrics.py` (counter container)
 - `nanovllm/engine/block_manager.py` (`clear_prefix_cache` helper)
 - `nanovllm/engine/llm_engine.py` (optional request metadata kwargs)
 
-Scheduling control flow is intentionally unchanged.
+TTFT / TPOT / E2E definitions are unchanged across branches.
