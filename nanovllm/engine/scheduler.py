@@ -325,6 +325,7 @@ class Scheduler:
         assert sum(s.num_scheduled_tokens for s in scheduled_seqs) <= self.max_num_batched_tokens
         output = SchedulerOutput(scheduled_seqs)
         self._record_iteration_metrics(output)
+        self._assert_model_runner_contract(output)
         return output
 
     # ------------------------------------------------------------------
@@ -378,15 +379,29 @@ class Scheduler:
             self.running.append(seq)
         return True
 
-    def _mlfq_preempt_for_append(self, seq: Sequence) -> tuple[bool, int]:
-        """Free KV for decode append. Returns (ok, num_preempted)."""
+    def _mlfq_preempt_for_append(
+        self,
+        seq: Sequence,
+        scheduled_seqs: list[Sequence],
+    ) -> tuple[bool, int]:
+        """Free KV for decode append. Returns (ok, num_preempted).
+
+        Never preempt a sequence already placed in ``scheduled_seqs`` for this
+        iteration: that would deallocate its block_table while ModelRunner still
+        expects matching slot_mapping entries (parity baseline only preempts
+        unscheduled RUNNING work, or self).
+        """
+        scheduled_ids = {s.seq_id for s in scheduled_seqs}
         num_preempted = 0
         while not self.block_manager.can_append(seq):
             victim = None
             for cand in reversed(self.running):
-                if cand is not seq and not cand.is_finished:
-                    victim = cand
-                    break
+                if cand is seq or cand.is_finished:
+                    continue
+                if cand.seq_id in scheduled_ids:
+                    continue
+                victim = cand
+                break
             if victim is None:
                 self.preempt(seq)
                 num_preempted += 1
@@ -427,19 +442,20 @@ class Scheduler:
             need = seq.remaining_compute_tokens
             take = min(need, token_budget, rem_q)
             if take <= 0:
-                seq.is_prefill = False
-            else:
-                seq.num_scheduled_tokens = take
-                seq.is_prefill = True
-                scheduled_seqs.append(seq)
-                self._instrument_on_schedule(seq)
-                self._mlfq_charge(seq, take)
-                if not seq.is_finished:
-                    mlfq_lib.place_on_level(self._mlfq_queues, seq)
-                return take, 0, True
+                # No prefill work under current budget; keep prefill flag and retry later.
+                mlfq_lib.place_on_level(self._mlfq_queues, seq)
+                return 0, 0, False
+            seq.num_scheduled_tokens = take
+            seq.is_prefill = True
+            scheduled_seqs.append(seq)
+            self._instrument_on_schedule(seq)
+            self._mlfq_charge(seq, take)
+            if not seq.is_finished:
+                mlfq_lib.place_on_level(self._mlfq_queues, seq)
+            return take, 0, True
 
         # Decode (1 token, also limited by remaining quantum).
-        ok, num_preempted = self._mlfq_preempt_for_append(seq)
+        ok, num_preempted = self._mlfq_preempt_for_append(seq, scheduled_seqs)
         if not ok:
             # seq was self-preempted; still on MLFQ queue via preempt()->waiting
             mlfq_lib.place_on_level(self._mlfq_queues, seq)
@@ -449,6 +465,9 @@ class Scheduler:
             return 0, num_preempted, False
 
         take = min(1, rem_q, token_budget)
+        if take <= 0:
+            mlfq_lib.place_on_level(self._mlfq_queues, seq)
+            return 0, num_preempted, False
         seq.num_scheduled_tokens = take
         seq.is_prefill = False
         self.block_manager.may_append(seq)
@@ -458,6 +477,62 @@ class Scheduler:
         if not seq.is_finished:
             mlfq_lib.place_on_level(self._mlfq_queues, seq)
         return take, num_preempted, True
+
+    def _assert_model_runner_contract(self, output: SchedulerOutput) -> None:
+        """Cheap invariants: scheduled metadata must match ModelRunner packing."""
+        seen: set[int] = set()
+        sum_scheduled = 0
+        for seq in output.seqs:
+            if seq.seq_id in seen:
+                raise RuntimeError(
+                    f"scheduler contract: duplicate seq_id={seq.seq_id} in one schedule()"
+                )
+            seen.add(seq.seq_id)
+            take = seq.num_scheduled_tokens
+            sum_scheduled += take
+            if take <= 0:
+                raise RuntimeError(
+                    "scheduler contract: non-positive scheduled tokens "
+                    f"seq_id={seq.seq_id} take={take}"
+                )
+            if not seq.block_table:
+                raise RuntimeError(
+                    "scheduler contract: scheduled sequence has empty block_table "
+                    f"(seq_id={seq.seq_id} status={seq.status.name} "
+                    f"is_prefill={seq.is_prefill} mlfq_level={seq.mlfq_level} "
+                    f"mlfq_service_in_level={seq.mlfq_service_in_level} "
+                    f"num_tokens={seq.num_tokens} num_prompt_tokens={seq.num_prompt_tokens} "
+                    f"num_computed_tokens={seq.num_computed_tokens} "
+                    f"scheduled_tokens={take} "
+                    f"iteration={self.metrics.scheduler_iterations})"
+                )
+            start = seq.num_cached_tokens
+            end = start + take
+            if seq.is_prefill:
+                if end > seq.num_tokens:
+                    raise RuntimeError(
+                        "scheduler contract: prefill scheduled past sequence end "
+                        f"seq_id={seq.seq_id} start={start} take={take} "
+                        f"num_tokens={seq.num_tokens}"
+                    )
+            elif take != 1:
+                raise RuntimeError(
+                    f"scheduler contract: decode must schedule 1 token, got {take} "
+                    f"seq_id={seq.seq_id}"
+                )
+            end_block = (end + self.block_size - 1) // self.block_size
+            if end_block > len(seq.block_table):
+                raise RuntimeError(
+                    "scheduler contract: block_table too short for scheduled span "
+                    f"seq_id={seq.seq_id} end={end} end_block={end_block} "
+                    f"block_table_len={len(seq.block_table)} is_prefill={seq.is_prefill} "
+                    f"mlfq_level={seq.mlfq_level} scheduled_tokens={take}"
+                )
+        if sum_scheduled != output.total_scheduled_tokens:
+            raise RuntimeError(
+                "scheduler contract: sum scheduled mismatch "
+                f"sum={sum_scheduled} output={output.total_scheduled_tokens}"
+            )
 
     def _schedule_mlfq(self) -> SchedulerOutput:
         scheduled_seqs: list[Sequence] = []
@@ -557,6 +632,7 @@ class Scheduler:
         assert sum(s.num_scheduled_tokens for s in scheduled_seqs) <= self.max_num_batched_tokens
         output = SchedulerOutput(scheduled_seqs)
         self._record_iteration_metrics(output)
+        self._assert_model_runner_contract(output)
         return output
 
     def schedule(self) -> SchedulerOutput:

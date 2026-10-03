@@ -313,3 +313,199 @@ def test_empty_batch_impossible_with_waiting_work():
     sched.add(_seq(50))
     out = sched.schedule()
     assert out.num_seqs > 0
+
+
+def _cpu_prepare_counts(seqs: list[Sequence]) -> tuple[int, int, int]:
+    """Mirror ModelRunner.prepare_prefill id/pos/slot lengths (CPU)."""
+    bs = Sequence.block_size
+    input_ids: list[int] = []
+    positions: list[int] = []
+    slot_mapping: list[int] = []
+    for seq in seqs:
+        start = seq.num_cached_tokens
+        end = start + seq.num_scheduled_tokens
+        if seq.is_prefill:
+            chunk = seq[start:end]
+            input_ids.extend(chunk if isinstance(chunk, list) else [chunk])
+        else:
+            input_ids.append(seq.last_token)
+        positions.extend(range(start, end))
+        assert seq.block_table, "scheduled seq must have KV blocks"
+        start_block = start // bs
+        end_block = (end + bs - 1) // bs
+        for i in range(start_block, end_block):
+            slot_start = seq.block_table[i] * bs
+            if i == start_block:
+                slot_start += start % bs
+            if i != end_block - 1:
+                slot_end = seq.block_table[i] * bs + bs
+            else:
+                slot_end = seq.block_table[i] * bs + end - i * bs
+            slot_mapping.extend(range(slot_start, slot_end))
+    return len(input_ids), len(positions), len(slot_mapping)
+
+
+def test_quantum_clipped_prefill_matches_runner_metadata():
+    sched = _make_mlfq(q0=64, boost=0, max_batched_tokens=10_000)
+    seq = _seq(300, max_tokens=2)
+    sched.add(seq)
+    out = sched.schedule()
+    assert seq.num_scheduled_tokens == 64
+    n_ids, n_pos, n_slots = _cpu_prepare_counts(out.seqs)
+    assert n_ids == n_pos == n_slots == 64 == out.total_scheduled_tokens
+
+
+def test_mixed_prefill_decode_token_counts_match_output():
+    sched = _make_mlfq(q0=10_000, boost=0, max_batched_tokens=32, max_seqs=4)
+    decode = _seq(8, max_tokens=3)
+    prefill = _seq(40, max_tokens=2)
+    sched.add(decode)
+    sched.block_manager.allocate(decode, 0)
+    decode.num_cached_tokens = decode.num_prompt_tokens
+    decode.is_prefill = False
+    decode.status = SequenceStatus.RUNNING
+    sched.waiting.remove(decode)
+    sched.running.append(decode)
+    sched.add(prefill)
+
+    out = sched.schedule()
+    assert out.num_seqs >= 1
+    ids = [s.seq_id for s in out.seqs]
+    assert len(ids) == len(set(ids))
+    n_ids, n_pos, n_slots = _cpu_prepare_counts(out.seqs)
+    assert n_ids == n_pos == n_slots == out.total_scheduled_tokens
+
+
+def test_demoted_sequence_not_served_twice_same_iteration():
+    sched = _make_mlfq(q0=32, q1=10_000, boost=0, max_batched_tokens=10_000, max_seqs=4)
+    seq = _seq(200, max_tokens=2)
+    sched.add(seq)
+    out = sched.schedule()
+    assert out.seqs == [seq]
+    assert seq.num_scheduled_tokens == 32
+    assert seq.mlfq_level == 1
+    ids = [s.seq_id for s in out.seqs]
+    assert ids.count(seq.seq_id) == 1
+
+
+def test_recompute_plus_quantum_clip_preserves_accounting():
+    sched = _make_mlfq(q0=64, q1=64, boost=0, max_batched_tokens=10_000, num_blocks=32)
+    seq = _seq(200, max_tokens=4)
+    sched.add(seq)
+    out = sched.schedule()
+    _advance_prefill(sched, seq)
+    assert seq.mlfq_level == 1
+    # Destructive preemption then recompute under Q1 quantum (still 0 service).
+    level = seq.mlfq_level
+    service = seq.mlfq_service_in_level
+    sched.preempt(seq)
+    assert seq.num_computed_tokens == 0
+    assert not seq.block_table
+    assert seq.mlfq_level == level
+    assert seq.mlfq_service_in_level == service
+    out = sched.schedule()
+    assert seq in out.seqs
+    assert seq.is_prefill
+    assert seq.num_scheduled_tokens == 64
+    n_ids, n_pos, n_slots = _cpu_prepare_counts(out.seqs)
+    assert n_ids == n_pos == n_slots == out.total_scheduled_tokens
+
+
+def test_boost_does_not_alter_kv_or_computed_state():
+    sched = _make_mlfq(q0=256, q1=1024, boost=1, max_batched_tokens=16)
+    seq = _seq(40, max_tokens=4)
+    sched.add(seq)
+    sched.block_manager.allocate(seq, 0)
+    seq.num_cached_tokens = 12
+    table_before = list(seq.block_table)
+    cached_before = seq.num_cached_tokens
+    seq.mlfq_level = 2
+    seq.mlfq_service_in_level = 50
+    sched._mlfq_queues[0].clear()
+    sched._mlfq_queues[2].append(seq)
+    seq.status = SequenceStatus.RUNNING
+    if seq in sched.waiting:
+        sched.waiting.remove(seq)
+    sched.running.append(seq)
+
+    # First schedule() increments epoch to 1 and boosts before serving.
+    out = sched.schedule()
+    assert seq.mlfq_level == 0
+    assert seq.block_table == table_before
+    # Serving may advance computed only via scheduled tokens, not boost itself.
+    assert seq.num_cached_tokens == cached_before
+    assert out.total_scheduled_tokens == sum(s.num_scheduled_tokens for s in out.seqs)
+
+
+def test_decode_append_never_preempts_already_scheduled_batch_mate():
+    """Regression: preempting a same-iteration scheduled seq emptied block_table.
+
+    That produced slot_mapping.numel() < len(input_ids) in prepare_prefill.
+    """
+    sched = _make_mlfq(q0=10_000, boost=0, max_batched_tokens=512, max_seqs=4, num_blocks=3)
+    victim = _seq(300, max_tokens=4)
+    decode = _seq(256, max_tokens=4)
+    sched.add(victim)
+    sched.add(decode)
+
+    sched.block_manager.allocate(victim, 0)
+    victim.num_cached_tokens = 0
+    victim.is_prefill = True
+    victim.status = SequenceStatus.RUNNING
+    sched.waiting.remove(victim)
+    sched.running.append(victim)
+
+    sched.block_manager.allocate(decode, 0)
+    decode.append_token(99)
+    decode.num_cached_tokens = 256
+    decode.is_prefill = False
+    decode.status = SequenceStatus.RUNNING
+    sched.waiting.remove(decode)
+    sched.running.append(decode)
+    assert len(decode) % 256 == 1
+    assert not sched.block_manager.can_append(decode)
+
+    out = sched.schedule()
+    assert victim in out.seqs
+    assert victim.block_table, "already-scheduled victim must keep KV"
+    assert decode not in out.seqs
+    assert decode.status == SequenceStatus.WAITING
+    n_ids, n_pos, n_slots = _cpu_prepare_counts(out.seqs)
+    assert n_ids == n_pos == n_slots == out.total_scheduled_tokens
+
+
+def test_mlfq_stress_runner_contract_seed42():
+    """Deterministic multi-request stress; catches same-batch preempt bugs."""
+    import random
+
+    rng = random.Random(42)
+    Sequence.counter = __import__("itertools").count(0)
+    sched = _make_mlfq(
+        q0=256, q1=1024, boost=256, max_batched_tokens=2048, max_seqs=16, num_blocks=48
+    )
+    for i in range(16):
+        plen = rng.choice([16, 64, 128, 200, 256, 300, 400, 512])
+        mout = rng.choice([1, 2, 4, 8, 16])
+        if i > 0 and rng.random() < 0.5:
+            toks = list(range(256))
+            rest = plen - 256
+            if rest > 0:
+                toks += [1000 + i * 10 + j for j in range(rest)]
+            toks = toks[:plen]
+        else:
+            toks = list(range(i * 10000, i * 10000 + plen))
+        sched.add(
+            Sequence(toks, SamplingParams(temperature=0.6, max_tokens=mout, ignore_eos=True))
+        )
+
+    for _ in range(4000):
+        if sched.is_finished():
+            break
+        out = sched.schedule()
+        ids = [s.seq_id for s in out.seqs]
+        assert len(ids) == len(set(ids))
+        n_ids, n_pos, n_slots = _cpu_prepare_counts(out.seqs)
+        assert n_ids == n_pos == n_slots == out.total_scheduled_tokens
+        tokens = [7] * out.num_seqs
+        sched.postprocess(out.seqs, tokens)
+    assert sched.is_finished()
