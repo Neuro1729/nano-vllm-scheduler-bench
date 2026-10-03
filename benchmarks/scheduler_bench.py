@@ -191,6 +191,7 @@ def run_once(
         "ignore_eos": True,
         "prefix_cache_policy": "cleared_between_runs; distinct synthetic prompts",
         "scheduler_policy": getattr(llm.config, "scheduler_policy", "fcfs"),
+        "scheduler_aging_threshold": getattr(llm.config, "scheduler_aging_threshold", 128),
     }
     config = {
         "max_model_len": llm.config.max_model_len,
@@ -202,6 +203,7 @@ def run_once(
         "kvcache_block_size": llm.config.kvcache_block_size,
         "num_kvcache_blocks": llm.config.num_kvcache_blocks,
         "scheduler_policy": getattr(llm.config, "scheduler_policy", "fcfs"),
+        "scheduler_aging_threshold": getattr(llm.config, "scheduler_aging_threshold", 128),
         "scaled_workload_ranges": describe_scaled_ranges(llm.config.max_model_len),
     }
     return build_result(
@@ -233,8 +235,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--scheduler-policy",
         type=str,
         default="fcfs",
-        choices=["fcfs", "sjf"],
+        choices=["fcfs", "sjf", "sjf_aging"],
         help="WAITING admission policy (dev experiments; default fcfs matches parity)",
+    )
+    p.add_argument(
+        "--aging-threshold",
+        type=int,
+        default=128,
+        help="For sjf_aging: waiting-age steps before starvation promotion (default 128)",
     )
     return p.parse_args(argv)
 
@@ -251,9 +259,13 @@ def main(argv: list[str] | None = None) -> int:
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
 
+    if args.aging_threshold < 1:
+        raise SystemExit("--aging-threshold must be >= 1")
+
     llm_kwargs = {
         "enforce_eager": args.enforce_eager,
         "scheduler_policy": args.scheduler_policy,
+        "scheduler_aging_threshold": args.aging_threshold,
     }
     if args.max_model_len is not None:
         llm_kwargs["max_model_len"] = args.max_model_len

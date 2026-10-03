@@ -19,11 +19,16 @@ class Config:
     # Experimental waiting-admission policy (`dev`). Default `fcfs` matches parity.
     # Validated in Scheduler via scheduler_policy.normalize_scheduler_policy.
     scheduler_policy: str = "fcfs"
+    # For scheduler_policy=sjf_aging: promote overdue WAITING requests after this
+    # many continuous waiting scheduler iterations. Ignored by fcfs/sjf.
+    scheduler_aging_threshold: int = 128
 
     def __post_init__(self):
         assert os.path.isdir(self.model)
         assert self.kvcache_block_size % 256 == 0
         assert 1 <= self.tensor_parallel_size <= 8
         self.scheduler_policy = str(self.scheduler_policy).strip().lower()
+        self.scheduler_aging_threshold = int(self.scheduler_aging_threshold)
+        assert self.scheduler_aging_threshold >= 1
         self.hf_config = AutoConfig.from_pretrained(self.model)
         self.max_model_len = min(self.max_model_len, self.hf_config.max_position_embeddings)

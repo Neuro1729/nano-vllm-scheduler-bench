@@ -12,7 +12,7 @@ from nanovllm.engine.scheduler_output import SchedulerOutput
 from nanovllm.engine.scheduler_policy import (
     normalize_scheduler_policy,
     pop_waiting_at,
-    select_waiting_index,
+    select_waiting_choice,
 )
 
 if TYPE_CHECKING:
@@ -30,18 +30,31 @@ class Scheduler:
         self.scheduler_policy = normalize_scheduler_policy(
             getattr(config, "scheduler_policy", "fcfs")
         )
+        self.scheduler_aging_threshold = int(getattr(config, "scheduler_aging_threshold", 128))
         self.block_manager = BlockManager(config.num_kvcache_blocks, config.kvcache_block_size)
         self.waiting: deque[Sequence] = deque()
         self.running: deque[Sequence] = deque()
         # INSTRUMENTATION-ONLY
         self.metrics = SchedulerMetrics(num_kv_blocks=max(config.num_kvcache_blocks, 1))
         self.metrics.scheduler_policy = self.scheduler_policy
+        self.metrics.scheduler_aging_threshold = self.scheduler_aging_threshold
 
     def is_finished(self):
         return not self.waiting and not self.running
 
     def add(self, seq: Sequence):
+        seq.waiting_age_steps = 0
         self.waiting.append(seq)
+
+    def _bump_waiting_ages(self) -> None:
+        """+1 waiting age for every request currently in WAITING (deterministic)."""
+        for seq in self.waiting:
+            seq.waiting_age_steps += 1
+            self.metrics.observe_waiting_age(seq.waiting_age_steps)
+
+    def _on_leave_waiting(self, seq: Sequence, *, aging_promoted: bool) -> None:
+        self.metrics.record_admission_age(seq.waiting_age_steps, aging_promoted=aging_promoted)
+        seq.waiting_age_steps = 0
 
     def _instrument_on_schedule(self, seq: Sequence) -> None:
         # INSTRUMENTATION-ONLY: counters/timestamps; no control-flow impact
@@ -141,6 +154,7 @@ class Scheduler:
     ) -> tuple[list[Sequence], int, int]:
         """WAITING admission with HOL skip; order from ``scheduler_policy``."""
         policy = getattr(self, "scheduler_policy", "fcfs")
+        aging_threshold = getattr(self, "scheduler_aging_threshold", 128)
         skipped: deque[Sequence] = deque()
         num_skipped = 0
         while (
@@ -149,10 +163,12 @@ class Scheduler:
             and len(scheduled_seqs) < self.max_num_seqs
             and len(self.running) < self.max_num_seqs
         ):
-            idx = select_waiting_index(policy, self.waiting)
-            if idx != 0:
+            choice = select_waiting_choice(
+                policy, self.waiting, aging_threshold=aging_threshold
+            )
+            if choice.index != 0:
                 self.metrics.waiting_reorders += 1
-            seq = pop_waiting_at(self.waiting, idx)
+            seq = pop_waiting_at(self.waiting, choice.index)
             self.metrics.examine_waiting_candidate()
             if not seq.block_table:
                 num_cached_blocks = self.block_manager.can_allocate(seq)
@@ -169,6 +185,7 @@ class Scheduler:
             if need <= 0:
                 # Prefix cache already covers every known token: decode-ready.
                 # Do not break the waiting queue (that caused empty-batch stalls).
+                self._on_leave_waiting(seq, aging_promoted=choice.aging_promoted)
                 seq.status = SequenceStatus.RUNNING
                 seq.is_prefill = False
                 self.running.append(seq)
@@ -178,6 +195,7 @@ class Scheduler:
             seq.num_scheduled_tokens = take
             seq.is_prefill = True
             token_budget -= take
+            self._on_leave_waiting(seq, aging_promoted=choice.aging_promoted)
             seq.status = SequenceStatus.RUNNING
             self.running.append(seq)
             scheduled_seqs.append(seq)
@@ -260,6 +278,10 @@ class Scheduler:
             scheduled_seqs, token_budget
         )
 
+        # Age every current WAITING resident once per schedule() (including those
+        # preempted earlier in this call). HOL skips do not reset age.
+        self._bump_waiting_ages()
+
         # Anti-thrash unless the batch is still empty (liveness for recompute).
         admit_waiting = (not preempted_this_step) or (not scheduled_seqs)
         if admit_waiting:
@@ -308,8 +330,11 @@ class Scheduler:
         # Destructive recompute: discard KV and invalidate compute progress.
         # deallocate() zeros num_cached_tokens (= num_computed_tokens) and clears
         # the block table. Prefix-cache hits are rediscovered on next allocate().
+        # Age restarts: waiting_age_steps measures the *current* continuous WAITING
+        # spell only (not lifetime cumulative wait).
         seq.status = SequenceStatus.WAITING
         seq.is_prefill = True
+        seq.waiting_age_steps = 0
         self.block_manager.deallocate(seq)
         assert seq.num_computed_tokens == 0
         assert not seq.block_table

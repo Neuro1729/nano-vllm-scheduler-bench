@@ -29,6 +29,10 @@ class Sequence:
         self.temperature = sampling_params.temperature
         self.max_tokens = sampling_params.max_tokens
         self.ignore_eos = sampling_params.ignore_eos
+        # Continuous WAITING spell age in scheduler iterations (sjf_aging).
+        # Starts at 0 on enter WAITING; +1 each schedule() while still waiting;
+        # resets on admit to RUNNING; restarts at 0 on recompute preemption re-entry.
+        self.waiting_age_steps = 0
         # INSTRUMENTATION-ONLY: unused by scheduling decisions
         self.workload_class = "unknown"
         self.arrival_time = 0.0

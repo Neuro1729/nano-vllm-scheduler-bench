@@ -1,4 +1,4 @@
-"""Deterministic FCFS control + SJF waiting-admission tests (no GPU)."""
+"""Deterministic FCFS / SJF / SJF+aging waiting-admission tests (no GPU)."""
 
 from collections import deque
 
@@ -7,6 +7,7 @@ from nanovllm.engine.scheduler import Scheduler
 from nanovllm.engine.scheduler_metrics import SchedulerMetrics
 from nanovllm.engine.scheduler_policy import (
     remaining_prefill_score,
+    select_waiting_choice,
     select_waiting_index,
     sjf_total_bound_score,
     waiting_selection_key,
@@ -20,6 +21,7 @@ def _make_scheduler(
     max_batched_tokens: int = 64,
     max_seqs: int = 8,
     num_blocks: int = 256,
+    aging_threshold: int = 128,
 ) -> Scheduler:
     Sequence.block_size = 256
     sched = Scheduler.__new__(Scheduler)
@@ -28,11 +30,13 @@ def _make_scheduler(
     sched.eos = -1
     sched.block_size = 256
     sched.scheduler_policy = policy
+    sched.scheduler_aging_threshold = aging_threshold
     sched.block_manager = BlockManager(num_blocks, 256)
     sched.waiting = deque()
     sched.running = deque()
     sched.metrics = SchedulerMetrics(num_kv_blocks=num_blocks)
     sched.metrics.scheduler_policy = policy
+    sched.metrics.scheduler_aging_threshold = aging_threshold
     return sched
 
 
@@ -43,9 +47,11 @@ def _seq(n_prompt: int, max_tokens: int = 4) -> Sequence:
     )
 
 
-def _admission_order(policy: str) -> list[int]:
+def _admission_order(policy: str, aging_threshold: int = 128) -> list[int]:
     """Return prompt lengths in the order requests are first admitted."""
-    sched = _make_scheduler(policy=policy, max_batched_tokens=32, max_seqs=1)
+    sched = _make_scheduler(
+        policy=policy, max_batched_tokens=32, max_seqs=1, aging_threshold=aging_threshold
+    )
     a = _seq(4000)
     b = _seq(100)
     c = _seq(500)
@@ -84,6 +90,65 @@ def test_fcfs_admits_in_arrival_order():
 def test_sjf_admits_shortest_remaining_prefill_first():
     """SJF over remaining_prefill_tokens: B(100) -> C(500) -> A(4000)."""
     assert _admission_order("sjf") == [100, 500, 4000]
+
+
+def test_sjf_aging_below_threshold_matches_sjf():
+    """Test 1: none overdue => same as SJF (B -> C -> A)."""
+    assert _admission_order("sjf_aging", aging_threshold=10_000) == [100, 500, 4000]
+
+
+def test_sjf_aging_promotes_overdue_long_request():
+    """Test 2: A aged past threshold beats shorter B/C."""
+    sched = _make_scheduler(policy="sjf_aging", max_batched_tokens=32, max_seqs=1, aging_threshold=8)
+    a = _seq(4000)
+    b = _seq(100)
+    c = _seq(500)
+    sched.add(a)
+    sched.add(b)
+    sched.add(c)
+    # After schedule()'s bump, age becomes threshold => overdue.
+    a.waiting_age_steps = 8
+    b.waiting_age_steps = 1
+    c.waiting_age_steps = 2
+    out = sched.schedule()
+    assert out.seqs[0] is a
+    assert sched.metrics.aging_promotions == 1
+
+
+def test_sjf_aging_multiple_overdue_picks_oldest():
+    """Test 3: among overdue, highest age wins; tie-break seq_id."""
+    a = _seq(4000)
+    b = _seq(100)
+    c = _seq(500)
+    a.waiting_age_steps = 20
+    b.waiting_age_steps = 50
+    c.waiting_age_steps = 50
+    waiting = deque([a, b, c])
+    choice = select_waiting_choice("sjf_aging", waiting, aging_threshold=10)
+    # b and c both age 50; lower seq_id wins among them.
+    assert choice.aging_promoted is True
+    assert waiting[choice.index] is b
+    assert b.seq_id < c.seq_id
+
+
+def test_waiting_age_increments_while_remaining_waiting():
+    """Test 4: age +1 per schedule() while still WAITING."""
+    sched = _make_scheduler(policy="sjf_aging", max_batched_tokens=32, max_seqs=1, aging_threshold=1000)
+    a = _seq(4000)
+    b = _seq(100)
+    sched.add(a)
+    sched.add(b)
+    assert a.waiting_age_steps == 0
+    out = sched.schedule()
+    assert out.seqs[0] is b
+    assert a in sched.waiting
+    assert a.waiting_age_steps == 1
+    # Keep B running without finishing; A should keep aging.
+    b.num_cached_tokens += b.num_scheduled_tokens
+    b.num_scheduled_tokens = 0
+    sched.schedule()
+    assert a.waiting_age_steps == 2
+    assert sched.metrics.max_waiting_age_steps >= 2
 
 
 def test_sjf_deterministic_tie_break_by_seq_id():
@@ -132,3 +197,20 @@ def test_sjf_counts_waiting_reorders_when_head_is_long():
     out = sched.schedule()
     assert out.seqs[0].num_prompt_tokens == 100
     assert sched.metrics.waiting_reorders >= 1
+
+
+def test_preempt_restarts_waiting_age():
+    """Test 6: recompute preemption starts a new waiting spell (age -> 0)."""
+    sched = _make_scheduler(policy="sjf_aging", max_batched_tokens=16, aging_threshold=64)
+    seq = _seq(20)
+    sched.block_manager.allocate(seq, 0)
+    seq.num_cached_tokens = seq.num_prompt_tokens
+    seq.status = SequenceStatus.RUNNING
+    seq.is_prefill = False
+    seq.waiting_age_steps = 99  # stale value must not survive preemption
+    sched.running.append(seq)
+    sched.running.remove(seq)
+    sched.preempt(seq)
+    assert seq.status == SequenceStatus.WAITING
+    assert seq.waiting_age_steps == 0
+    assert seq in sched.waiting

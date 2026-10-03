@@ -34,8 +34,14 @@ class SchedulerMetrics:
     waiting_candidates_examined: int = 0
     # Times WAITING admission selected a non-head candidate (SJF reorders).
     waiting_reorders: int = 0
-    # Policy name copied from Config for benchmark JSON (does not affect counting).
+    # sjf_aging: successful admits chosen because age >= threshold.
+    aging_promotions: int = 0
+    max_waiting_age_steps: int = 0
+    _admission_age_sum: int = 0
+    _admission_age_count: int = 0
+    # Policy name / threshold copied from Config for benchmark JSON.
     scheduler_policy: str = "fcfs"
+    scheduler_aging_threshold: int = 128
     peak_kv_blocks_used: int = 0
     peak_kv_utilization: float = 0.0
     _kv_util_sum: float = 0.0
@@ -61,7 +67,11 @@ class SchedulerMetrics:
         self.hol_skipped_requests = 0
         self.waiting_candidates_examined = 0
         self.waiting_reorders = 0
-        # Keep scheduler_policy across reset (config-level attribute).
+        self.aging_promotions = 0
+        self.max_waiting_age_steps = 0
+        self._admission_age_sum = 0
+        self._admission_age_count = 0
+        # Keep scheduler_policy / threshold across reset (config-level attributes).
         self.peak_kv_blocks_used = 0
         self.peak_kv_utilization = 0.0
         self._kv_util_sum = 0.0
@@ -74,6 +84,15 @@ class SchedulerMetrics:
 
     def examine_waiting_candidate(self) -> None:
         self.waiting_candidates_examined += 1
+
+    def observe_waiting_age(self, age: int) -> None:
+        self.max_waiting_age_steps = max(self.max_waiting_age_steps, age)
+
+    def record_admission_age(self, age: int, *, aging_promoted: bool) -> None:
+        self._admission_age_sum += age
+        self._admission_age_count += 1
+        if aging_promoted:
+            self.aging_promotions += 1
 
     def record_allocation_failure(self, *, hol_skipped: bool) -> None:
         """Record a waiting-admission can_allocate(seq) == -1 event.
@@ -111,6 +130,12 @@ class SchedulerMetrics:
             return 0.0
         return self.allocation_failed_candidates / self.waiting_candidates_examined
 
+    @property
+    def mean_age_at_admission(self) -> float:
+        if self._admission_age_count == 0:
+            return 0.0
+        return self._admission_age_sum / self._admission_age_count
+
     def to_dict(self) -> dict:
         return {
             "scheduler_iterations": self.scheduler_iterations,
@@ -131,7 +156,11 @@ class SchedulerMetrics:
             "hol_skipped_requests": self.hol_skipped_requests,
             "waiting_candidates_examined": self.waiting_candidates_examined,
             "waiting_reorders": self.waiting_reorders,
+            "aging_promotions": self.aging_promotions,
+            "max_waiting_age_steps": self.max_waiting_age_steps,
+            "mean_age_at_admission": self.mean_age_at_admission,
             "scheduler_policy": self.scheduler_policy,
+            "scheduler_aging_threshold": self.scheduler_aging_threshold,
             "allocation_candidate_failure_rate": self.allocation_candidate_failure_rate,
             "peak_KV_blocks_used": self.peak_kv_blocks_used,
             "average_KV_utilization": self.average_kv_utilization,

@@ -20,17 +20,24 @@ Optional future bound (not the default policy)::
 
 FCFS uses waiting-queue order (parity control). SJF only reorders WAITING
 admission; it does not preempt RUNNING work for a shorter arrival (not SRTF).
+
+SJF+aging (``sjf_aging``)
+-------------------------
+Same SJF score, but if any WAITING request has ``waiting_age_steps >= threshold``,
+admit the oldest overdue request instead (starvation guard). Age is counted in
+scheduler iterations, not wall-clock time. See Sequence.waiting_age_steps.
 """
 
 from __future__ import annotations
 
 from collections import deque
+from dataclasses import dataclass
 from typing import Literal
 
 from nanovllm.engine.sequence import Sequence
 
-SchedulerPolicyName = Literal["fcfs", "sjf"]
-VALID_SCHEDULER_POLICIES: frozenset[str] = frozenset({"fcfs", "sjf"})
+SchedulerPolicyName = Literal["fcfs", "sjf", "sjf_aging"]
+VALID_SCHEDULER_POLICIES: frozenset[str] = frozenset({"fcfs", "sjf", "sjf_aging"})
 
 
 def normalize_scheduler_policy(name: str) -> SchedulerPolicyName:
@@ -49,36 +56,74 @@ def remaining_prefill_score(seq: Sequence) -> int:
 def sjf_total_bound_score(seq: Sequence) -> int:
     """Optional future score: known prefill work + remaining max_tokens budget.
 
-    Not used by the default ``sjf`` policy; kept for later experiments.
+    Not used by the default ``sjf`` / ``sjf_aging`` policies; kept for later experiments.
     """
     remaining_out = max(0, seq.max_tokens - seq.num_completion_tokens)
     return remaining_prefill_score(seq) + remaining_out
 
 
 def waiting_selection_key(policy: SchedulerPolicyName, seq: Sequence, queue_index: int) -> tuple:
-    """Ascending sort key for WAITING admission (lower wins)."""
+    """Ascending sort key for plain FCFS / SJF WAITING admission (lower wins)."""
     if policy == "fcfs":
         return (queue_index, seq.seq_id)
-    if policy == "sjf":
+    if policy in ("sjf", "sjf_aging"):
+        # Plain SJF key (aging override is handled in select_waiting_choice).
         return (remaining_prefill_score(seq), seq.seq_id)
     raise ValueError(f"unsupported scheduler_policy={policy!r}")
 
 
-def select_waiting_index(policy: SchedulerPolicyName, waiting: deque[Sequence]) -> int:
-    """Index of the next WAITING candidate under ``policy``."""
+@dataclass(frozen=True, slots=True)
+class WaitingChoice:
+    index: int
+    aging_promoted: bool = False
+
+
+def select_waiting_choice(
+    policy: SchedulerPolicyName,
+    waiting: deque[Sequence],
+    *,
+    aging_threshold: int = 128,
+) -> WaitingChoice:
+    """Choose the next WAITING candidate under ``policy``."""
     if not waiting:
         raise IndexError("waiting queue is empty")
     if policy == "fcfs":
-        return 0
-    # Size-aware policies (SJF): lowest waiting_selection_key wins.
+        return WaitingChoice(0, False)
+
+    if policy == "sjf_aging":
+        if aging_threshold < 1:
+            raise ValueError(f"aging_threshold must be >= 1, got {aging_threshold}")
+        overdue = [i for i, seq in enumerate(waiting) if seq.waiting_age_steps >= aging_threshold]
+        if overdue:
+            # Oldest overdue first; tie-break lower seq_id.
+            best_i = overdue[0]
+            best_key = (-waiting[best_i].waiting_age_steps, waiting[best_i].seq_id)
+            for i in overdue[1:]:
+                key = (-waiting[i].waiting_age_steps, waiting[i].seq_id)
+                if key < best_key:
+                    best_i = i
+                    best_key = key
+            return WaitingChoice(best_i, True)
+
+    # SJF and non-overdue sjf_aging: shortest remaining compute, then seq_id.
     best_i = 0
-    best_key = waiting_selection_key(policy, waiting[0], 0)
+    best_key = waiting_selection_key("sjf", waiting[0], 0)
     for i in range(1, len(waiting)):
-        key = waiting_selection_key(policy, waiting[i], i)
+        key = waiting_selection_key("sjf", waiting[i], i)
         if key < best_key:
             best_i = i
             best_key = key
-    return best_i
+    return WaitingChoice(best_i, False)
+
+
+def select_waiting_index(
+    policy: SchedulerPolicyName,
+    waiting: deque[Sequence],
+    *,
+    aging_threshold: int = 128,
+) -> int:
+    """Index of the next WAITING candidate under ``policy``."""
+    return select_waiting_choice(policy, waiting, aging_threshold=aging_threshold).index
 
 
 def pop_waiting_at(waiting: deque[Sequence], index: int) -> Sequence:

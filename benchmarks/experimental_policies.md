@@ -5,10 +5,24 @@
 ## Config
 
 ```text
---scheduler-policy fcfs|sjf   (default: fcfs)
+--scheduler-policy fcfs|sjf|sjf_aging   (default: fcfs)
+--aging-threshold N                    (default: 128; used by sjf_aging)
 ```
 
 `fcfs` must match parity waiting-queue order. `sjf` only reorders WAITING admission.
+`sjf_aging` is SJF with bounded-wait starvation promotion.
+
+### Waiting age (`sjf_aging`)
+
+| Event | Age effect |
+|-------|------------|
+| Enter WAITING (`add`) | start at 0 |
+| Each `schedule()` while still WAITING | `+1` (after running pass, before admit) |
+| HOL skip / lose SJF contest | age **kept** (not reset) |
+| Admitted to RUNNING | reset to 0 |
+| Recompute preemption back to WAITING | **restart at 0** (new continuous spell) |
+
+Age is scheduler iterations, not wall-clock. Restart-on-preempt keeps the metric equal to the current waiting spell and avoids carrying stale age across successful service.
 
 ## SJF score (implemented)
 
